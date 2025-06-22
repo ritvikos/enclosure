@@ -1,8 +1,9 @@
-use crate::context::GlobalContext;
+use crate::context::{BASE_PATH, GlobalContext};
 use anyhow::{Context, Result, bail};
 use nix::{
     libc::{PR_SET_NO_NEW_PRIVS, prctl},
-    unistd::{Uid, setfsuid},
+    mount::{MsFlags, mount},
+    unistd::{Uid, pivot_root, setfsuid},
 };
 
 /// The process and its children are prevented from gaining new privileges via `execve()`
@@ -40,6 +41,41 @@ pub(crate) fn setuid_restrict_fs_privileges() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Recursively marks the root mount (`/`) as a *slave* to prevent mount
+/// propagation from the current mount namespace back to the host.
+pub fn set_mounts_slave_recursive() -> Result<()> {
+    let flags = MsFlags::MS_REC | MsFlags::MS_SLAVE | MsFlags::MS_SILENT;
+    mount::<str, str, str, str>(None, BASE_PATH, None, flags, None)?;
+    Ok(())
+}
+
+pub fn set_tmpfs() -> Result<()> {
+    let flags = MsFlags::MS_NODEV | MsFlags::MS_NOSUID;
+    mount::<str, str, str, str>(Some("tmpfs"), BASE_PATH, Some("tmpfs"), flags, None)?;
+    Ok(())
+}
+
+pub fn bind_mount_self(src: &str) -> Result<()> {
+    let flags = MsFlags::MS_MGC_VAL | MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_SILENT;
+    mount::<str, str, str, str>(Some(src), src, None, flags, None)?;
+    Ok(())
+}
+
+pub fn change_root(new: &str, put_old: &str) -> Result<()> {
+    Ok(pivot_root(new, put_old)?)
+}
+
+pub fn chdir(path: &str) -> Result<()> {
+    nix::unistd::chdir(path)?;
+    Ok(())
+}
+
+pub struct MountHardener<'a> {
+    base_path: &'a str,
+    new_root: &'a str,
+    old_root: &'a str,
 }
 
 #[cfg(test)]

@@ -1,9 +1,16 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use nix::{
     fcntl::{FcntlArg, fcntl},
     unistd::{SysconfVar, sysconf},
 };
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::{
+    fs::{self, Permissions},
+    os::{
+        fd::{AsRawFd, BorrowedFd},
+        unix::fs::{DirBuilderExt, PermissionsExt},
+    },
+    path::Path,
+};
 
 /// Executes a closure with a borrowed FD while ensuring that the provided FD is valid.
 pub fn with_raw_fd<T: AsRawFd, F>(raw_fd: T, f: F) -> Result<()>
@@ -46,4 +53,80 @@ pub fn page_size() -> Result<usize> {
         Some(_) => Err(anyhow!("PAGE_SIZE returned non-positive value")),
         None => Err(anyhow!("PAGE_SIZE is not defined on this system")),
     }
+}
+
+pub fn getcwd() -> Result<std::path::PathBuf> {
+    Ok(nix::unistd::getcwd()?)
+}
+
+pub fn create_file<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
+    let path = path.as_ref();
+
+    let file = fs::File::create_new(path)?;
+    file.set_permissions(Permissions::from_mode(mode))?;
+
+    Ok(())
+}
+
+pub fn create_file_recursive<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
+    let path = path.as_ref();
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    create_file(path, mode)?;
+
+    Ok(())
+}
+
+pub fn ensure_file<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
+    let path = path.as_ref();
+
+    if !path.is_file() {
+        bail!("Path \"{}\" is not a file", path.to_string_lossy());
+    }
+
+    if path.exists() {
+        return Ok(());
+    }
+
+    create_file_recursive(path, mode)?;
+
+    Ok(())
+}
+
+pub fn create_directory<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
+    let path = path.as_ref();
+
+    fs::DirBuilder::new().mode(mode).create(path)?;
+
+    Ok(())
+}
+
+pub fn create_directory_recursive<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
+    let path = path.as_ref();
+
+    fs::DirBuilder::new()
+        .mode(mode)
+        .recursive(true)
+        .create(path)?;
+
+    Ok(())
+}
+
+pub fn ensure_directory<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
+    let path = path.as_ref();
+
+    if !path.is_dir() {
+        bail!("Path \"{}\" is not a directory", path.to_string_lossy());
+    }
+
+    if path.exists() {
+        return Ok(());
+    }
+
+    create_directory_recursive(path, mode)?;
+
+    Ok(())
 }

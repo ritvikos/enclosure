@@ -3,6 +3,8 @@ use anyhow::{Context, Result, bail};
 use nix::unistd::{Uid, geteuid, getuid};
 use std::cell::RefCell;
 
+pub const BASE_PATH: &str = "/tmp";
+
 thread_local! {
     static GLOBAL_CONTEXT: RefCell<Option<GlobalContext>> = RefCell::new(None);
 }

@@ -5,8 +5,11 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.98"
+bincode = { version = "2.0.1", features = ["serde"] }
 caps = "0.5.5"
 clap = { version = "4.5.39", features = ["derive"] }
+num_enum = "0.7.3"
 memmap2 = "0.9.5"
-nix = { version = "0.30.1", features = ["event", "feature", "fs", "sched", "signal", "user"] }
+nix = { version = "0.30.1", features = ["event", "feature", "fs", "mount", "sched", "signal", "socket", "user"] }
 once_cell = "1.21.3"
+serde = { version = "1.0.219", features = ["derive"] }
