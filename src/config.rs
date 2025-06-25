@@ -37,6 +37,12 @@ pub struct Config {
 
     #[command(flatten)]
     pub debug: DebugOptions,
+
+    #[arg(value_name = "EXECUTABLE")]
+    pub executable: PathBuf,
+
+    #[arg(value_name = "ARGS", trailing_var_arg = true)]
+    pub args: Vec<String>,
 }
 
 impl Config {

@@ -1,12 +1,14 @@
 use anyhow::{Result, anyhow, bail};
 use nix::{
-    fcntl::{FcntlArg, fcntl},
+    errno::Errno,
+    fcntl::{FcntlArg, OFlag, fcntl, openat},
+    sys::stat::Mode,
     unistd::{SysconfVar, sysconf},
 };
 use std::{
-    fs::{self, Permissions},
+    fs::{self, File, Permissions},
     os::{
-        fd::{AsRawFd, BorrowedFd},
+        fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
         unix::fs::{DirBuilderExt, PermissionsExt},
     },
     path::Path,
@@ -52,6 +54,19 @@ pub fn page_size() -> Result<usize> {
         Some(size) if size > 0 => Ok(size as usize),
         Some(_) => Err(anyhow!("PAGE_SIZE returned non-positive value")),
         None => Err(anyhow!("PAGE_SIZE is not defined on this system")),
+    }
+}
+
+pub fn retry_on_interrupt<T, F>(mut operation: F) -> Result<T, std::io::Error>
+where
+    F: FnMut() -> Result<T, std::io::Error>,
+{
+    loop {
+        match operation() {
+            Ok(result) => return Ok(result),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -129,4 +144,26 @@ pub fn ensure_directory<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
     create_directory_recursive(path, mode)?;
 
     Ok(())
+}
+
+pub struct Dir<'a> {
+    fd: BorrowedFd<'a>,
+}
+
+impl Dir<'_> {
+    pub fn open_with<P: AsRef<Path>>(&self, path: &P, flags: OFlag) -> std::io::Result<File> {
+        let path = path.as_ref();
+
+        let fd = retry_on_interrupt(|| Ok(openat(self.fd, path, flags, Mode::empty())?))?;
+        let file = File::from(fd);
+
+        // let file = unsafe { File::from_raw_fd(fd.as_raw_fd()) };
+        Ok(file)
+    }
+}
+
+impl<'a> From<BorrowedFd<'a>> for Dir<'a> {
+    fn from(fd: BorrowedFd<'a>) -> Self {
+        Self { fd }
+    }
 }

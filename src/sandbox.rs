@@ -3,14 +3,25 @@ use crate::{
         CapabilityBuilder, CapabilityManager, SETUID_CAPABILITIES, apply_setuid_capabilities,
     },
     config::Config,
-    context::{GlobalContext, PrivilegeLevel, ROOTLESS_WITH_CAPABILITY_ERROR_MESSAGE},
+    context::{GlobalContext, OverFlowIds, PrivilegeLevel, ROOTLESS_WITH_CAPABILITY_ERROR_MESSAGE},
     hardener,
     jail::Jail,
     jailer::{Jailable, JailerBuilder},
-    utils::with_raw_fd,
+    print_capability_snapshot, utils,
 };
 use anyhow::{Result, bail};
-use nix::sched::{CloneFlags, setns};
+use nix::{
+    fcntl::OFlag,
+    sched::{CloneFlags, setns},
+    sys::stat::Mode,
+    unistd::{Gid, Pid, Uid},
+};
+use std::{
+    fs::File,
+    io::Write,
+    os::fd::{AsFd, BorrowedFd},
+    path::Path,
+};
 
 #[derive(Debug)]
 pub struct Enclosure {
@@ -30,15 +41,16 @@ impl Enclosure {
 
     pub fn spawn(&self) -> Result<()> {
         let flags = self.config.parse_clone_flags()?;
+        let proc_fd = nix::fcntl::open("/proc", OFlag::O_PATH, Mode::empty())?;
 
         if let Some(fd) = self.config.user.userns {
-            with_raw_fd(fd, |borrowed_fd| {
+            utils::with_raw_fd(fd, |borrowed_fd| {
                 setns(borrowed_fd, flags)?;
                 return Ok(());
             })?;
         };
 
-        self.spawn_inner(flags)?;
+        self.spawn_inner(flags, proc_fd.as_fd())?;
 
         Ok(())
     }
@@ -82,8 +94,8 @@ impl Enclosure {
         Ok(manager)
     }
 
-    fn spawn_inner(&self, flags: CloneFlags) -> Result<()> {
-        let jail = Jail::new(&self.config);
+    fn spawn_inner<'a>(&self, flags: CloneFlags, proc_fd: BorrowedFd<'a>) -> Result<()> {
+        let jail = Jail::new(&self.config, proc_fd);
 
         let jailer = JailerBuilder::new(jail)?
             .with_stack_size(Self::STACK_SIZE)
@@ -102,13 +114,14 @@ impl Enclosure {
 
     fn configure_parent(&self) -> Result<()> {
         let context = GlobalContext::current();
+        print_capability_snapshot!("[PARENT]: CAPABILITIES AFTER SPAWNING CHILD");
 
         if context.setuid() && self.config.namespace.unshare_user {
             // TODO: write uid / gid mapping
         }
 
         if let Some(raw_fd) = self.config.user.switch_userns {
-            with_raw_fd(raw_fd, |fd| {
+            utils::with_raw_fd(raw_fd, |fd| {
                 setns(fd, CloneFlags::CLONE_NEWUSER)?;
                 Ok(())
             })?;

@@ -1,7 +1,7 @@
 use crate::capabilities::has_any_permitted_capabilities;
 use anyhow::{Context, Result, bail};
-use nix::unistd::{Uid, geteuid, getuid};
-use std::cell::RefCell;
+use nix::unistd::{Gid, Uid, geteuid, getgid, getuid};
+use std::{cell::RefCell, fs};
 
 pub const BASE_PATH: &str = "/tmp";
 
@@ -21,7 +21,9 @@ pub enum PrivilegeLevel {
 pub struct GlobalContext {
     ruid: Uid,
     euid: Uid,
+    guid: Gid,
     level: PrivilegeLevel,
+    overflow: OverFlowIds,
 }
 
 impl GlobalContext {
@@ -54,6 +56,11 @@ impl GlobalContext {
     }
 
     #[inline]
+    pub fn guid(&self) -> Gid {
+        self.guid
+    }
+
+    #[inline]
     pub fn root(&self) -> bool {
         self.euid().is_root()
     }
@@ -73,9 +80,26 @@ impl GlobalContext {
         self.level
     }
 
+    #[inline]
+    pub fn overflow_ids(&self) -> OverFlowIds {
+        self.overflow
+    }
+
+    #[inline]
+    pub fn overflow_uid(&self) -> Uid {
+        self.overflow.uid
+    }
+
+    #[inline]
+    pub fn overflow_gid(&self) -> Gid {
+        self.overflow.gid
+    }
+
     fn new() -> Result<Self> {
         let ruid = getuid();
         let euid = geteuid();
+        let guid = getgid();
+        let overflow = OverFlowIds::read()?;
 
         let level = if ruid != euid {
             if euid.as_raw() != 0 {
@@ -93,7 +117,41 @@ impl GlobalContext {
             PrivilegeLevel::Rootless
         };
 
-        Ok(Self { ruid, euid, level })
+        Ok(Self {
+            ruid,
+            euid,
+            guid,
+            level,
+            overflow,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct OverFlowIds {
+    pub uid: Uid,
+    pub gid: Gid,
+}
+
+impl OverFlowIds {
+    const OVERFLOW_UID_PATH: &str = "/proc/sys/kernel/overflowuid";
+    const OVERFLOW_GID_PATH: &str = "/proc/sys/kernel/overflowgid";
+
+    pub fn read() -> Result<Self> {
+        let uid = fs::read_to_string(Self::OVERFLOW_UID_PATH)?;
+        let gid = fs::read_to_string(Self::OVERFLOW_GID_PATH)?;
+
+        let uid = uid.trim().parse::<u32>()?;
+        let gid = gid.trim().parse::<u32>()?;
+
+        Ok(Self::new(uid, gid))
+    }
+
+    fn new<T: Into<Uid>, U: Into<Gid>>(uid: T, gid: U) -> Self {
+        Self {
+            uid: uid.into(),
+            gid: gid.into(),
+        }
     }
 }
 

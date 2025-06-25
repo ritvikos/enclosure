@@ -14,7 +14,7 @@ use nix::{
     },
     unistd::Pid,
 };
-use std::{cell::Cell, marker::PhantomData};
+use std::{cell::Cell, marker::PhantomData, os::fd::BorrowedFd};
 
 pub struct JailerBuilder<'builder, C: Jailable<'builder>> {
     target: C,
@@ -47,6 +47,7 @@ impl<'builder, C: Jailable<'builder>> JailerBuilder<'builder, C> {
         assert!(self.stack_bytes >= 64 * 1024, "stack size too small");
 
         Jailer {
+            context: GlobalContext::current(),
             notifier: self.notifier,
             target: self.target,
             report: self.report,
@@ -61,6 +62,7 @@ pub struct Jailer<'jailer, C: Jailable<'jailer>> {
     notifier: Notifier,
     report: ErrorReporter,
     stack_bytes: usize,
+    context: GlobalContext,
     _marker: PhantomData<&'jailer ()>,
 }
 
@@ -106,7 +108,7 @@ impl<'jailer, C: Jailable<'jailer>> Jailer<'jailer, C> {
         GlobalContext::init()?;
 
         // Prepare the child's execution environment
-        self.target.prepare()?;
+        self.target.prepare(&self.context)?;
 
         // Execute the process
         self.target.execute()?;
@@ -259,8 +261,10 @@ impl Drop for JailHandle<'_> {
 
 pub trait Jailable<'a> {
     fn config(&self) -> &Config;
-    fn new(config: &'a Config) -> Self;
-    fn prepare(&self) -> Result<()>;
+    fn proc_fd(&self) -> BorrowedFd<'a>;
+
+    fn new(config: &'a Config, proc_fd: BorrowedFd<'a>) -> Self;
+    fn prepare(&self, parent_context: &GlobalContext) -> Result<()>;
     fn execute(&self) -> Result<isize>; // TODO: Path as well
     fn cleanup(&self) -> Result<()>;
 }
