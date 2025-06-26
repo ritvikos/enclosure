@@ -43,9 +43,17 @@ impl CapabilityManager {
         })
     }
 
+    pub fn acquire_child_privileges(in_new_ns: bool) -> Result<()> {
+        if in_new_ns {
+            Self::drop_all_bounding_capabilities()?;
+        }
+
+        Ok(())
+    }
+
     pub fn clear_unprivileged_capabilities(&self) -> Result<()> {
         for cap_set in Self::UNPRIVILEGED_SETS {
-            self.clear_capability_set(cap_set)?;
+            Self::clear_capability_set(cap_set)?;
         }
 
         Ok(())
@@ -57,7 +65,7 @@ impl CapabilityManager {
 
         for capability in available_capabilities {
             if !requested.contains(&capability) {
-                if let Err(err) = self.drop_bounding_capability(capability) {
+                if let Err(err) = Self::drop_bounding_capability(capability) {
                     if self.config.permissive_mode && self.is_expected_error(&err) {
                         eprintln!("Ignoring expected error dropping {capability:?}: {err}");
                         continue;
@@ -71,11 +79,11 @@ impl CapabilityManager {
     }
 
     /// Drop all capabilities from the bounding set
-    pub fn drop_all_bounding_capabilities(&self) -> Result<()> {
+    pub fn drop_all_bounding_capabilities() -> Result<()> {
         let bounding_caps = Self::read_capability_set(CapSet::Bounding)?;
 
         for capability in bounding_caps {
-            self.drop_bounding_capability(capability)?;
+            Self::drop_bounding_capability(capability)?;
         }
 
         Ok(())
@@ -104,7 +112,7 @@ impl CapabilityManager {
             .unwrap_or_else(|| CapsHashSet::new())
     }
 
-    fn set_capability_set(&self, cap_set: CapSet, capabilities: &CapsHashSet) -> Result<()> {
+    fn set_capability_set(cap_set: CapSet, capabilities: &CapsHashSet) -> Result<()> {
         caps::set(None, cap_set, capabilities)
             .context(format!("Failed to set {:?} capability set", cap_set))?;
         Ok(())
@@ -114,7 +122,7 @@ impl CapabilityManager {
         caps::read(None, cap_set).context(format!("Failed to read {:?} capability set", cap_set))
     }
 
-    fn clear_capability_set(&self, cap_set: CapSet) -> Result<()> {
+    fn clear_capability_set(cap_set: CapSet) -> Result<()> {
         caps::clear(None, cap_set)
             .context(format!("Failed to clear {:?} capability set", cap_set))?;
         Ok(())
@@ -135,7 +143,7 @@ impl CapabilityManager {
         Ok(caps::runtime::thread_all_supported())
     }
 
-    fn drop_bounding_capability(&self, capability: Capability) -> Result<()> {
+    fn drop_bounding_capability(capability: Capability) -> Result<()> {
         caps::drop(None, CapSet::Bounding, capability).context(format!(
             "Failed to drop bounding capability: {}",
             capability
@@ -247,12 +255,12 @@ pub(crate) fn has_any_permitted_capabilities() -> Result<bool> {
 pub(crate) fn apply_setuid_capabilities(manager: &CapabilityManager) -> Result<()> {
     let caps = manager.user_defined_capabilities();
 
-    manager.drop_all_bounding_capabilities()?;
+    CapabilityManager::drop_all_bounding_capabilities()?;
     manager.retain_requested_capabilities(&caps)?;
 
-    manager.set_capability_set(CapSet::Effective, &caps)?;
-    manager.set_capability_set(CapSet::Permitted, &caps)?;
+    CapabilityManager::set_capability_set(CapSet::Effective, &caps)?;
+    CapabilityManager::set_capability_set(CapSet::Permitted, &caps)?;
 
-    manager.clear_capability_set(CapSet::Inheritable)?;
+    CapabilityManager::clear_capability_set(CapSet::Inheritable)?;
     Ok(())
 }

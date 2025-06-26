@@ -1,12 +1,5 @@
-use std::{
-    fs::File,
-    io::Write,
-    os::fd::{AsFd, BorrowedFd},
-    path::Path,
-};
-
 use crate::{
-    context::{BASE_PATH, GlobalContext, OverFlowIds},
+    context::{GlobalContext, OverFlowIds},
     utils,
 };
 use anyhow::{Context, Result, bail};
@@ -14,10 +7,19 @@ use nix::{
     fcntl::OFlag,
     libc::{PR_SET_NO_NEW_PRIVS, prctl},
     mount::{MntFlags, mount, umount2},
-    unistd::{Gid, Pid, Uid, fchdir, pivot_root, setfsuid},
+    unistd::{Gid, Pid, Uid, setfsuid},
+};
+use std::{
+    fs::File,
+    io::Write,
+    os::fd::{AsFd, BorrowedFd},
+    path::Path,
 };
 
-pub use nix::mount::MsFlags;
+pub use nix::{
+    mount::MsFlags,
+    unistd::{chdir, pivot_root},
+};
 
 /// The process and its children are prevented from gaining new privileges via `execve()`
 pub(crate) fn apply_no_new_privs() -> Result<()> {
@@ -59,49 +61,35 @@ pub(crate) fn setuid_restrict_fs_privileges() -> Result<()> {
 /// Recursively marks the root mount (`/`) as a *slave* to prevent mount
 /// propagation from the current mount namespace back to the host.
 pub fn set_mounts_slave_recursive() -> Result<()> {
-    let flags = MsFlags::MS_REC | MsFlags::MS_SLAVE | MsFlags::MS_SILENT;
-    mount::<str, str, str, str>(None, BASE_PATH, None, flags, None)?;
+    mount::<str, str, str, str>(None, "/", None, MsFlags::MS_REC | MsFlags::MS_SLAVE, None)?;
     Ok(())
 }
 
-pub fn set_tmpfs() -> Result<()> {
-    let flags = MsFlags::MS_NODEV | MsFlags::MS_NOSUID;
-    mount::<str, str, str, str>(Some("tmpfs"), BASE_PATH, Some("tmpfs"), flags, None)?;
+pub fn set_tmpfs(target: &str) -> Result<()> {
+    mount::<str, str, str, str>(
+        Some("tmpfs"),
+        target,
+        Some("tmpfs"),
+        MsFlags::MS_NODEV | MsFlags::MS_NOSUID,
+        None,
+    )?;
+
     Ok(())
 }
 
-pub fn bind_mount_self(src: &str) -> Result<()> {
-    let flags = MsFlags::MS_MGC_VAL | MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_SILENT;
-    mount::<str, str, str, str>(Some(src), src, None, flags, None)?;
+pub fn bind_mount_self(source: &str) -> Result<()> {
+    remount_with_flags(source, MsFlags::MS_BIND | MsFlags::MS_REC)?;
     Ok(())
 }
 
-pub fn change_root(new: &str, put_old: &str) -> Result<()> {
-    Ok(pivot_root(new, put_old)?)
-}
-
-pub fn chdir(path: &str) -> Result<()> {
-    nix::unistd::chdir(path)?;
-    Ok(())
-}
-
-pub fn remount_with_flags(src: &str, flags: MsFlags) -> Result<()> {
-    mount::<str, str, str, str>(Some(src), src, None, flags, None)?;
+pub fn remount_with_flags(source: &str, flags: MsFlags) -> Result<()> {
+    mount::<str, str, str, str>(Some(source), source, None, flags, None)?;
     Ok(())
 }
 
 pub fn unmount_fs(target: &str) -> Result<()> {
     umount2(target, MntFlags::MNT_DETACH)?;
     Ok(())
-}
-
-pub fn change_working_dir<'a>(fd: BorrowedFd<'a>) -> Result<()> {
-    fchdir(fd)?;
-    Ok(())
-}
-
-pub fn get_env(path: &str) -> Result<String> {
-    Ok(std::env::var("HOME")?)
 }
 
 pub struct MountHardener<'a> {

@@ -1,6 +1,5 @@
 use crate::{
     config::{FileOp, MountCommand, MountCommands, MountOp, SpecialMount, SystemOp},
-    context::GlobalContext,
     jail::Jail,
     privsep::{Supervisor, Worker, privsep},
     utils,
@@ -8,10 +7,8 @@ use crate::{
 use anyhow::Result;
 
 impl Jail<'_> {
-    pub fn handle_mounts(&self) -> Result<()> {
-        let context = GlobalContext::current();
-
-        if context.setuid() {
+    pub fn handle_mounts(&self, setuid: bool) -> Result<()> {
+        if setuid {
             privsep::<MountCommand, _, _>(
                 |worker| self.mount_worker(worker),
                 |supervisor| self.mount_supervisor(supervisor),

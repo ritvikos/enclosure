@@ -56,7 +56,7 @@ impl<T: Decode<()>> AsFd for Supervisor<T> {
 pub struct Worker<T: Encode>(OwnedFd, PhantomData<T>);
 
 impl<T: Encode> Worker<T> {
-    pub fn send(&self, command: &T) -> Result<()> {
+    pub fn send(&self, command: T) -> Result<()> {
         let buf = bincode::encode_to_vec(command, bincode::config::standard())?;
         write(self.as_fd(), buf.as_slice())?;
         Ok(())

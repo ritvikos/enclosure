@@ -104,9 +104,6 @@ impl<'jailer, C: Jailable<'jailer>> Jailer<'jailer, C> {
         // Wait for the parent's signal to continue execution
         self.notifier.wait_for_signal()?;
 
-        // Initialize global context for the child
-        GlobalContext::init()?;
-
         // Prepare the child's execution environment
         self.target.prepare(&self.context)?;
 
@@ -265,6 +262,6 @@ pub trait Jailable<'a> {
 
     fn new(config: &'a Config, proc_fd: BorrowedFd<'a>) -> Self;
     fn prepare(&self, parent_context: &GlobalContext) -> Result<()>;
-    fn execute(&self) -> Result<isize>; // TODO: Path as well
+    fn execute(&self) -> Result<isize>;
     fn cleanup(&self) -> Result<()>;
 }
