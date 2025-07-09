@@ -1,12 +1,12 @@
 use crate::{
     capabilities::{
-        CapabilityBuilder, CapabilityManager, SETUID_CAPABILITIES, apply_setuid_capabilities,
+        apply_setuid_capabilities, CapabilityBuilder, CapabilityManager, SETUID_CAPABILITIES
     },
     config::Config,
     context::{GlobalContext, OverFlowIds, PrivilegeLevel, ROOTLESS_WITH_CAPABILITY_ERROR_MESSAGE},
     hardener,
     jail::Jail,
-    jailer::{Jailable, JailerBuilder},
+    jailer::{HostResource, Jailable, JailerBuilder},
     print_capability_snapshot, utils,
 };
 use anyhow::{Result, bail};
@@ -42,6 +42,7 @@ impl Enclosure {
     pub fn spawn(&self) -> Result<()> {
         let flags = self.config.parse_clone_flags()?;
         let proc_fd = nix::fcntl::open("/proc", OFlag::O_PATH, Mode::empty())?;
+        let resource = HostResource::new(proc_fd.as_fd());
 
         if let Some(fd) = self.config.user.userns {
             utils::with_raw_fd(fd, |borrowed_fd| {
@@ -50,7 +51,7 @@ impl Enclosure {
             })?;
         };
 
-        self.spawn_inner(flags, proc_fd.as_fd())?;
+        self.spawn_inner(flags, resource)?;
 
         Ok(())
     }
@@ -94,8 +95,8 @@ impl Enclosure {
         Ok(manager)
     }
 
-    fn spawn_inner<'a>(&self, flags: CloneFlags, proc_fd: BorrowedFd<'a>) -> Result<()> {
-        let jail = Jail::new(&self.config, proc_fd);
+    fn spawn_inner<'a>(&self, flags: CloneFlags, resource: HostResource<'a>) -> Result<()> {
+        let jail = Jail::new(&self.config, resource);
 
         let jailer = JailerBuilder::new(jail)?
             .with_stack_size(Self::STACK_SIZE)

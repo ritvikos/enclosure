@@ -256,11 +256,26 @@ impl Drop for JailHandle<'_> {
     }
 }
 
-pub trait Jailable<'a> {
-    fn config(&self) -> &Config;
-    fn proc_fd(&self) -> BorrowedFd<'a>;
+pub struct HostResource<'resource> {
+    proc_fd: BorrowedFd<'resource>,
+}
 
-    fn new(config: &'a Config, proc_fd: BorrowedFd<'a>) -> Self;
+impl<'resource> HostResource<'resource> {
+    pub fn new(proc_fd: BorrowedFd<'resource>) -> Self {
+        Self { proc_fd }
+    }
+
+    #[inline]
+    pub fn proc_fd(&self) -> BorrowedFd<'resource> {
+        self.proc_fd
+    }
+}
+
+pub trait Jailable<'jail> {
+    fn config(&self) -> &Config;
+    fn resource(&self) -> &HostResource<'jail>;
+
+    fn new(config: &'jail Config, resource: HostResource<'jail>) -> Self;
     fn prepare(&self, parent_context: &GlobalContext) -> Result<()>;
     fn execute(&self) -> Result<isize>;
     fn cleanup(&self) -> Result<()>;

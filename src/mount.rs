@@ -112,8 +112,6 @@ impl Jail<'_> {
         let commands = MountCommands::from(mount_config);
 
         for command in commands.iter() {
-            // worker.send(command)?;
-
             match command {
                 MountCommand::Mount(op) => match op {
                     MountOp::Bind {
@@ -126,8 +124,6 @@ impl Jail<'_> {
                         } else if target.is_file() {
                             utils::ensure_file(target, 0444)?;
                         }
-
-                        // TODO: Handle race condition
                     }
 
                     MountOp::Overlay {
@@ -174,6 +170,8 @@ impl Jail<'_> {
                     SystemOp::Chmod { path, mode } => todo!(),
                 },
             }
+
+            worker.send(&command)?;
         }
 
         Ok(())

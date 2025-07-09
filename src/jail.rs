@@ -3,12 +3,12 @@ use crate::{
     config::Config,
     context::GlobalContext,
     hardener::{self, IdMapWriter},
-    jailer::Jailable,
+    jailer::{HostResource, Jailable},
     utils,
 };
 use anyhow::Result;
 use nix::unistd::{Gid, Uid, execvp};
-use std::{ffi::CString, os::fd::BorrowedFd};
+use std::ffi::CString;
 
 const BASE_PATH: &str = "/tmp";
 const NEW_ROOT: &str = "newroot";
@@ -16,7 +16,7 @@ const OLD_ROOT: &str = "oldroot";
 
 pub struct Jail<'jail> {
     pub config: &'jail Config,
-    pub proc_fd: BorrowedFd<'jail>,
+    pub resource: HostResource<'jail>,
 }
 
 impl Jail<'_> {
@@ -34,16 +34,16 @@ impl Jail<'_> {
 }
 
 impl<'a> Jailable<'a> for Jail<'a> {
-    fn new(config: &'a Config, proc_fd: BorrowedFd<'a>) -> Self {
-        Self { config, proc_fd }
+    fn new(config: &'a Config, resource: HostResource<'a>) -> Self {
+        Self { config, resource }
     }
 
     fn config(&self) -> &Config {
         self.config
     }
 
-    fn proc_fd(&self) -> BorrowedFd<'a> {
-        self.proc_fd
+    fn resource(&self) -> &HostResource<'a> {
+        &self.resource
     }
 
     fn prepare(&self, parent_context: &GlobalContext) -> Result<()> {
@@ -75,7 +75,7 @@ impl<'a> Jailable<'a> for Jail<'a> {
                 None,
             );
 
-            writer.write(self.proc_fd())?;
+            writer.write(self.resource.proc_fd())?;
             println!("[CHILD]: Wrote Mappings");
         }
 

@@ -124,13 +124,6 @@ pub struct NamespaceOptions {
 
     #[arg(
         long,
-        help = "Create new mount namespace",
-        help_heading = HEADING_NAMESPACES
-    )]
-    pub unshare_ns: bool,
-
-    #[arg(
-        long,
         help = "Create new time namespace",
         help_heading = HEADING_NAMESPACES
     )]
@@ -145,7 +138,7 @@ pub struct NamespaceOptions {
 }
 
 impl NamespaceOptions {
-    fn mappings(&self) -> [(bool, CloneFlags); 10] {
+    fn mappings(&self) -> [(bool, CloneFlags); 9] {
         [
             (self.unshare_files, CloneFlags::CLONE_FILES),
             (self.unshare_fs, CloneFlags::CLONE_FS),
@@ -153,7 +146,6 @@ impl NamespaceOptions {
             (self.unshare_user, CloneFlags::CLONE_NEWUSER),
             (self.unshare_ipc, CloneFlags::CLONE_NEWIPC),
             (self.unshare_net, CloneFlags::CLONE_NEWNET),
-            (self.unshare_ns, CloneFlags::CLONE_NEWNS),
             (self.unshare_pid, CloneFlags::CLONE_NEWPID),
             (self.unshare_uts, CloneFlags::CLONE_NEWUTS),
             (self.unshare_sysvsem, CloneFlags::CLONE_SYSVSEM),
