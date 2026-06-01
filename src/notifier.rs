@@ -1,38 +1,35 @@
-use core::fmt;
-
 use anyhow::{Context, Result};
-use nix::{
-    sys::eventfd::{EfdFlags, EventFd},
-    unistd::{read, write},
-};
+use std::os::fd::{AsFd, OwnedFd};
 
-pub struct Notifier {
-    inner: EventFd,
+// Blocks waiting for the parent's signal
+pub struct NotifierReceiver {
+    read_fd: OwnedFd,
 }
 
-impl Notifier {
-    pub fn new() -> Result<Self> {
-        let inner = EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC)
-            .context("Failed to create EventFd")?;
-
-        Ok(Self { inner })
-    }
-
-    pub fn wait_for_signal(&self) -> Result<usize> {
+impl NotifierReceiver {
+    pub fn wait_for_signal(self) -> Result<()> {
         let mut buffer = 0u64.to_ne_bytes();
-        let read = read(&self.inner, &mut buffer).context("Failed to read signal value")?;
-        Ok(read)
-    }
-
-    pub fn signal(&self) -> Result<()> {
-        let buffer = 1u64.to_ne_bytes();
-        write(&self.inner, &buffer).context("Failed to write signal value")?;
+        nix::unistd::read(&self.read_fd.as_fd(), &mut buffer)
+            .context("failed to read signal value")?;
         Ok(())
     }
 }
 
-impl fmt::Debug for Notifier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Notifier").field("fd", &self.inner).finish()
+// Sends the signal to unblock the child
+pub struct NotifierSender {
+    write_fd: OwnedFd,
+}
+
+impl NotifierSender {
+    pub fn signal(&self) -> Result<()> {
+        let buffer = 1u64.to_ne_bytes();
+        nix::unistd::write(&self.write_fd.as_fd(), &buffer)
+            .context("failed to write signal value")?;
+        Ok(())
     }
+}
+
+pub fn notifier_pair() -> Result<(NotifierSender, NotifierReceiver)> {
+    let (read_fd, write_fd) = nix::unistd::pipe().context("Failed to create notifier pipe")?;
+    Ok((NotifierSender { write_fd }, NotifierReceiver { read_fd }))
 }
