@@ -1,14 +1,15 @@
+use crate::context::OverFlowIds;
 use anyhow::{Result, anyhow, bail};
 use nix::{
-    errno::Errno,
     fcntl::{FcntlArg, OFlag, fcntl, openat},
     sys::stat::Mode,
-    unistd::{SysconfVar, sysconf},
+    unistd::{Gid, Pid, SysconfVar, Uid, sysconf},
 };
 use std::{
-    fs::{self, File, Permissions},
+    fs::{DirBuilder, File, Permissions, create_dir_all},
+    io::Write,
     os::{
-        fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+        fd::{AsFd, AsRawFd, BorrowedFd},
         unix::fs::{DirBuilderExt, PermissionsExt},
     },
     path::Path,
@@ -77,7 +78,7 @@ pub fn getcwd() -> Result<std::path::PathBuf> {
 pub fn create_file<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
     let path = path.as_ref();
 
-    let file = fs::File::create_new(path)?;
+    let file = File::create_new(path)?;
     file.set_permissions(Permissions::from_mode(mode))?;
 
     Ok(())
@@ -87,7 +88,7 @@ pub fn create_file_recursive<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
     let path = path.as_ref();
 
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        create_dir_all(parent)?;
     }
 
     create_file(path, mode)?;
@@ -98,11 +99,10 @@ pub fn create_file_recursive<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
 pub fn ensure_file<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
     let path = path.as_ref();
 
-    if !path.is_file() {
-        bail!("Path \"{}\" is not a file", path.to_string_lossy());
-    }
-
     if path.exists() {
+        if !path.is_file() {
+            bail!("Path \"{}\" is not a file", path.to_string_lossy());
+        }
         return Ok(());
     }
 
@@ -114,18 +114,7 @@ pub fn ensure_file<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
 pub fn create_directory<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
     let path = path.as_ref();
 
-    fs::DirBuilder::new().mode(mode).create(path)?;
-
-    Ok(())
-}
-
-pub fn create_directory_recursive<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
-    let path = path.as_ref();
-
-    fs::DirBuilder::new()
-        .mode(mode)
-        .recursive(true)
-        .create(path)?;
+    DirBuilder::new().mode(mode).recursive(true).create(path)?;
 
     Ok(())
 }
@@ -133,15 +122,14 @@ pub fn create_directory_recursive<P: AsRef<Path>>(path: P, mode: u32) -> Result<
 pub fn ensure_directory<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
     let path = path.as_ref();
 
-    if !path.is_dir() {
-        bail!("Path \"{}\" is not a directory", path.to_string_lossy());
-    }
-
     if path.exists() {
+        if !path.is_dir() {
+            bail!("Path \"{}\" is not a directory", path.to_string_lossy());
+        }
         return Ok(());
     }
 
-    create_directory_recursive(path, mode)?;
+    DirBuilder::new().mode(mode).recursive(true).create(path)?;
 
     Ok(())
 }
@@ -151,13 +139,16 @@ pub struct Dir<'a> {
 }
 
 impl Dir<'_> {
-    pub fn open_with<P: AsRef<Path>>(&self, path: &P, flags: OFlag) -> std::io::Result<File> {
+    pub fn open_with<P: AsRef<Path> + ?Sized>(
+        &self,
+        path: &P,
+        flags: OFlag,
+    ) -> std::io::Result<File> {
         let path = path.as_ref();
 
         let fd = retry_on_interrupt(|| Ok(openat(self.fd, path, flags, Mode::empty())?))?;
         let file = File::from(fd);
 
-        // let file = unsafe { File::from_raw_fd(fd.as_raw_fd()) };
         Ok(file)
     }
 }
@@ -165,5 +156,93 @@ impl Dir<'_> {
 impl<'a> From<BorrowedFd<'a>> for Dir<'a> {
     fn from(fd: BorrowedFd<'a>) -> Self {
         Self { fd }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct IdentityMap {
+    sandbox_uid: Uid,
+    sandbox_gid: Gid,
+    host_uid: Uid,
+    host_gid: Gid,
+    overflow: OverFlowIds,
+}
+
+impl IdentityMap {
+    pub fn new(
+        sandbox_uid: Uid,
+        sandbox_gid: Gid,
+        host_uid: Uid,
+        host_gid: Gid,
+        overflow: OverFlowIds,
+    ) -> Self {
+        Self {
+            sandbox_uid,
+            sandbox_gid,
+            host_uid,
+            host_gid,
+            overflow,
+        }
+    }
+
+    pub fn uid_map(&self) -> String {
+        format!("{} {} 1\n", self.sandbox_uid, self.host_uid)
+    }
+
+    pub fn gid_map(&self) -> String {
+        format!("{} {} 1\n", self.sandbox_gid, self.host_gid)
+    }
+}
+
+fn write_proc_map_file(parent: &File, name: &str, content: &str) -> Result<()> {
+    let dir = Dir::from(parent.as_fd());
+    let mut file = dir.open_with(name, OFlag::O_WRONLY | OFlag::O_CLOEXEC)?;
+
+    retry_on_interrupt(|| file.write_all(content.as_bytes()))?;
+
+    Ok(())
+}
+
+pub struct ExternalWriter {
+    pid: Pid,
+    map: IdentityMap,
+}
+
+impl ExternalWriter {
+    pub fn new(pid: Pid, map: IdentityMap) -> Self {
+        Self { pid, map }
+    }
+
+    pub fn write(&self, proc_fd: BorrowedFd<'_>) -> Result<()> {
+        let dir = Dir::from(proc_fd);
+        let pid_str = i32::from(self.pid).to_string();
+        let parent = dir.open_with(&pid_str, OFlag::O_PATH)?;
+
+        write_proc_map_file(&parent, "setgroups", "deny\n")?;
+        write_proc_map_file(&parent, "uid_map", &self.map.uid_map())?;
+        write_proc_map_file(&parent, "gid_map", &self.map.gid_map())?;
+
+        Ok(())
+    }
+}
+
+pub struct SelfWriter {
+    map: IdentityMap,
+}
+
+impl SelfWriter {
+    pub fn new(map: IdentityMap) -> Self {
+        Self { map }
+    }
+
+    pub fn write(&self, proc_fd: BorrowedFd<'_>) -> Result<()> {
+        let dir = Dir::from(proc_fd);
+        let parent = dir.open_with("self", OFlag::O_PATH)?;
+
+        write_proc_map_file(&parent, "setgroups", "deny\n")?;
+        write_proc_map_file(&parent, "uid_map", &self.map.uid_map())?;
+        write_proc_map_file(&parent, "gid_map", &self.map.gid_map())?;
+
+        Ok(())
     }
 }
