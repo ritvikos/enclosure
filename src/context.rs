@@ -1,11 +1,18 @@
 use crate::capabilities::has_any_permitted_capabilities;
 use anyhow::{Context, Result, bail};
 use nix::unistd::{Gid, Uid, geteuid, getgid, getuid};
-use std::{cell::RefCell, fs};
+use std::{cell::RefCell, marker::PhantomData};
 
 thread_local! {
-    static GLOBAL_CONTEXT: RefCell<Option<GlobalContext>> = RefCell::new(None);
+    static PARENT_CONTEXT: RefCell<Option<ProcessContext<Parent>>> = RefCell::new(None);
+    static CHILD_CONTEXT: RefCell<Option<ProcessContext<Child>>> = RefCell::new(None);
 }
+
+#[derive(Clone, Copy)]
+pub struct Parent;
+
+#[derive(Clone, Copy)]
+pub struct Child;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PrivilegeLevel {
@@ -16,31 +23,107 @@ pub enum PrivilegeLevel {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct GlobalContext {
+pub struct ProcessContext<Role> {
     ruid: Uid,
     euid: Uid,
     guid: Gid,
     level: PrivilegeLevel,
     overflow: OverFlowIds,
+    _role: PhantomData<Role>,
 }
 
-impl GlobalContext {
-    /// Creates a new instance of `GlobalContext`
-    #[deny(unused)]
+impl ProcessContext<Parent> {
     pub fn init() -> Result<()> {
-        let context = GlobalContext::new().context("Failed to create global context")?;
+        let context = ProcessContext::<Parent>::new().context("Failed to create parent context")?;
 
-        GLOBAL_CONTEXT.with(|cell| {
+        PARENT_CONTEXT.with(|cell| {
             *cell.borrow_mut() = Some(context);
         });
 
         Ok(())
     }
 
-    /// Get the current context
-    pub fn current() -> Self {
-        // SAFETY: The global context is guaranteed to be initialized
-        GLOBAL_CONTEXT.with(|cell| unsafe { cell.borrow().unwrap_unchecked() })
+    /// # Safety
+    /// Must be called only after `ProcessContext::<Parent>::init()`.
+    pub unsafe fn get() -> Self {
+        PARENT_CONTEXT.with(|cell| unsafe {
+            let opt: &Option<Self> = &*cell.borrow();
+            *opt.as_ref().unwrap_unchecked()
+        })
+    }
+
+    /// # Safety
+    /// Child context must have been initialized via `ProcessContext::<Child>::init_child()`.
+    pub unsafe fn child(&self) -> ProcessContext<Child> {
+        CHILD_CONTEXT.with(|cell| unsafe {
+            let opt: &Option<ProcessContext<Child>> = &*cell.borrow();
+            *opt.as_ref().unwrap_unchecked()
+        })
+    }
+}
+
+impl ProcessContext<Child> {
+    pub fn init_child() -> Result<()> {
+        let context = ProcessContext::<Child>::new().context("Failed to create child context")?;
+
+        CHILD_CONTEXT.with(|cell| {
+            *cell.borrow_mut() = Some(context);
+        });
+
+        Ok(())
+    }
+
+    /// # Safety
+    /// Must be called only after `ProcessContext::<Child>::init_child()`.
+    pub unsafe fn get() -> Self {
+        CHILD_CONTEXT.with(|cell| unsafe {
+            let opt: &Option<Self> = &*cell.borrow();
+            *opt.as_ref().unwrap_unchecked()
+        })
+    }
+
+    /// # Safety
+    /// Parent context must have been initialized via `ProcessContext::<Parent>::init()`.
+    pub unsafe fn parent(&self) -> ProcessContext<Parent> {
+        PARENT_CONTEXT.with(|cell| unsafe {
+            let opt: &Option<ProcessContext<Parent>> = &*cell.borrow();
+            *opt.as_ref().unwrap_unchecked()
+        })
+    }
+}
+
+#[allow(unused)]
+impl<R> ProcessContext<R> {
+    fn new() -> Result<Self> {
+        let ruid = getuid();
+        let euid = geteuid();
+        let guid = getgid();
+        let overflow = OverFlowIds::read()?;
+
+        let level = if ruid != euid {
+            if euid.as_raw() != 0 {
+                bail!(
+                    "FATAL: setuid binary must elevate to root (euid=0), but got euid={}",
+                    euid
+                );
+            }
+            PrivilegeLevel::Setuid
+        } else if euid.as_raw() == 0 {
+            PrivilegeLevel::Root
+        } else if has_any_permitted_capabilities()? {
+            PrivilegeLevel::RootlessWithCapabilities
+        } else {
+            PrivilegeLevel::Rootless
+        };
+
+        Ok(Self {
+            ruid,
+            euid,
+            guid,
+            level,
+            overflow,
+            _role: PhantomData,
+        })
     }
 
     #[inline]
@@ -92,37 +175,6 @@ impl GlobalContext {
     pub fn overflow_gid(&self) -> Gid {
         self.overflow.gid
     }
-
-    fn new() -> Result<Self> {
-        let ruid = getuid();
-        let euid = geteuid();
-        let guid = getgid();
-        let overflow = OverFlowIds::read()?;
-
-        let level = if ruid != euid {
-            if euid.as_raw() != 0 {
-                bail!(
-                    "FATAL: setuid binary must elevate to root (euid=0), but got euid={}",
-                    euid
-                );
-            }
-            PrivilegeLevel::Setuid
-        } else if euid.as_raw() == 0 {
-            PrivilegeLevel::Root
-        } else if has_any_permitted_capabilities()? {
-            PrivilegeLevel::RootlessWithCapabilities
-        } else {
-            PrivilegeLevel::Rootless
-        };
-
-        Ok(Self {
-            ruid,
-            euid,
-            guid,
-            level,
-            overflow,
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -136,8 +188,8 @@ impl OverFlowIds {
     const OVERFLOW_GID_PATH: &str = "/proc/sys/kernel/overflowgid";
 
     pub fn read() -> Result<Self> {
-        let uid = fs::read_to_string(Self::OVERFLOW_UID_PATH)?;
-        let gid = fs::read_to_string(Self::OVERFLOW_GID_PATH)?;
+        let uid = std::fs::read_to_string(Self::OVERFLOW_UID_PATH)?;
+        let gid = std::fs::read_to_string(Self::OVERFLOW_GID_PATH)?;
 
         let uid = uid.trim().parse::<u32>()?;
         let gid = gid.trim().parse::<u32>()?;
