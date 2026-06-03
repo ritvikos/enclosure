@@ -2,9 +2,10 @@ use crate::{Parent, ProcessContext, context::OverFlowIds};
 use anyhow::{Context, Result, anyhow, bail};
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl, openat},
+    libc::{PR_SET_NO_NEW_PRIVS, prctl},
     sched::CloneFlags,
     sys::{stat::Mode, utsname::uname},
-    unistd::{Gid, Pid, SysconfVar, Uid, sysconf},
+    unistd::{Gid, Pid, SysconfVar, Uid, setfsuid, sysconf},
 };
 use std::{
     fs::{DirBuilder, File, Permissions, create_dir_all},
@@ -15,6 +16,44 @@ use std::{
     },
     path::{Path, PathBuf},
 };
+
+pub(crate) fn apply_no_new_privs() -> Result<()> {
+    let ret = unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if ret != 0 {
+        eprintln!("PR_SET_NO_NEW_PRIVS: Failed to set this flag");
+        Err(std::io::Error::last_os_error()).context("Failed to restrict privileges")
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn setuid_restrict_fs_privileges() -> Result<()> {
+    // SAFETY: parent context is initialized in main()
+    let context = unsafe { ProcessContext::<Parent>::get() };
+    let target = context.ruid();
+
+    // 1. Request FSUID change
+    setfsuid(target);
+
+    // 2. Read current FSUID with setfsuid(-1)
+    let current = setfsuid(Uid::from_raw(!0u32));
+
+    // 3. Compare actual FSUID with target
+    if current != target {
+        bail!(
+            "FSUID: Failed to set FSUID to {} (current FSUID is {})",
+            target,
+            current
+        );
+    }
+
+    Ok(())
+}
+
+pub(crate) fn resolve_path(root: &Path, path: &Path) -> PathBuf {
+    let stripped = path.strip_prefix("/").unwrap_or(path);
+    root.join(stripped)
+}
 
 /// Executes a closure with a borrowed FD while ensuring that the provided FD is valid.
 pub fn with_raw_fd<T: AsRawFd, F>(raw_fd: T, f: F) -> Result<()>
