@@ -1,6 +1,8 @@
-use crate::{checks::is_namespace_supported, utils::is_fd_valid};
+pub use crate::{
+    mount::{BindOptions, FileOp, MountCommand, MountOp, OverlayMode, SpecialMount, SystemOp},
+    utils::{is_fd_valid, is_namespace_supported},
+};
 use anyhow::{Error, Result, anyhow};
-use bincode::{Decode, Encode};
 use clap::{ArgGroup, Args, Parser};
 use nix::sched::CloneFlags;
 use std::{path::PathBuf, str::FromStr};
@@ -17,7 +19,7 @@ const HEADING_MOUNT: &str = "Mount";
 const HEADING_ENVIRONMENT: &str = "Environment";
 const HEADING_DEBUG: &str = "Debug";
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "Enclosure", about = "Unprivileged Sandboxing Tool")]
 pub struct Config {
     #[command(flatten)]
@@ -43,21 +45,29 @@ pub struct Config {
 
     #[arg(value_name = "ARGS", trailing_var_arg = true)]
     pub args: Vec<String>,
+
+    #[arg(skip)]
+    pub mount_commands: MountCommands,
 }
 
 impl Config {
     pub fn parse_clone_flags(&self) -> Result<CloneFlags, Error> {
         self.namespace.parse()
     }
+
+    pub fn prepare(&mut self) {
+        let opts = std::mem::take(&mut self.mount);
+        self.mount_commands = opts.into_commands();
+    }
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct GeneralOptions {
     #[arg(long, help = "Print version", help_heading = HEADING_GENERAL)]
     pub version: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct NamespaceOptions {
     #[arg(
         long,
@@ -178,7 +188,7 @@ impl NamespaceOptions {
     }
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 #[command(group(ArgGroup::new("userns_mode").args(&["userns", "unshare_user"]).multiple(false).required(false)))]
 pub struct UserOptions {
     #[arg(
@@ -240,7 +250,7 @@ pub struct UserOptions {
     pub hostname: Option<String>,
 }
 
-#[derive(Args, Debug, Clone)]
+#[derive(Args, Debug, Clone, Default)]
 pub struct MountOptions {
     /// Base directory for mount operations
     #[arg(
@@ -256,35 +266,35 @@ pub struct MountOptions {
         value_parser = PathPair::from_str,
         help_heading = HEADING_MOUNT
     )]
-    pub bind: Option<PathPair>,
+    pub bind: Vec<PathPair>,
 
     /// Bind mount with device access
     #[arg(
         long,
         help_heading = HEADING_MOUNT
     )]
-    pub dev_bind: Option<PathPair>,
+    pub dev_bind: Vec<PathPair>,
 
     /// Read-only bind mount
     #[arg(
         long,
         help_heading = HEADING_MOUNT
     )]
-    pub ro_bind: Option<PathPair>,
+    pub ro_bind: Vec<PathPair>,
 
     /// Bind mount from file descriptor (FD DEST pairs)
     #[arg(
         long,
         help_heading = HEADING_MOUNT
     )]
-    pub bind_fd: Option<FdPathPair>,
+    pub bind_fd: Vec<FdPathPair>,
 
     /// Read-only bind mount from file descriptor (FD DEST pairs)
     #[arg(
         long,
         help_heading = HEADING_MOUNT
     )]
-    pub ro_bind_fd: Option<FdPathPair>,
+    pub ro_bind_fd: Vec<FdPathPair>,
 
     /// Remount paths as read-only
     #[arg(
@@ -346,7 +356,7 @@ pub struct MountOptions {
         long,
         help_heading = HEADING_MOUNT
     )]
-    pub symlink: Option<PathPair>,
+    pub symlink: Vec<PathPair>,
 
     /// Set default permissions (octal format, e.g., 755)
     #[arg(
@@ -371,7 +381,7 @@ pub struct MountOptions {
 }
 
 /// Represents a source-destination path pair
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PathPair {
     pub source: PathBuf,
     pub destination: PathBuf,
@@ -396,14 +406,14 @@ impl FromStr for PathPair {
 }
 
 /// Represents a file descriptor and destination path pair
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FdPathPair {
     pub fd: i32,
     pub destination: PathBuf,
 }
 
 /// Represents a chmod operation with permissions and target path
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChmodPair {
     pub permissions: u32,
     pub path: PathBuf,
@@ -455,7 +465,7 @@ impl std::str::FromStr for ChmodPair {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct OctalPermissions(pub u32);
 
 impl std::str::FromStr for OctalPermissions {
@@ -468,7 +478,7 @@ impl std::str::FromStr for OctalPermissions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Size(pub u64);
 
 impl std::str::FromStr for Size {
@@ -499,11 +509,13 @@ impl std::str::FromStr for Size {
     }
 }
 
-impl From<MountOptions> for MountCommands {
-    fn from(opts: MountOptions) -> Self {
+pub type MountCommands = Vec<MountCommand>;
+
+impl MountOptions {
+    pub fn into_commands(self) -> MountCommands {
         let mut ops = Vec::new();
 
-        if let Some(bind) = opts.bind {
+        for bind in self.bind {
             ops.push(MountCommand::Mount(MountOp::Bind {
                 source: bind.source,
                 target: bind.destination,
@@ -514,7 +526,7 @@ impl From<MountOptions> for MountCommands {
             }));
         }
 
-        if let Some(dev_bind) = opts.dev_bind {
+        for dev_bind in self.dev_bind {
             ops.push(MountCommand::Mount(MountOp::Bind {
                 source: dev_bind.source,
                 target: dev_bind.destination,
@@ -525,7 +537,7 @@ impl From<MountOptions> for MountCommands {
             }));
         }
 
-        if let Some(ro_bind) = opts.ro_bind {
+        for ro_bind in self.ro_bind {
             ops.push(MountCommand::Mount(MountOp::Bind {
                 source: ro_bind.source,
                 target: ro_bind.destination,
@@ -536,57 +548,57 @@ impl From<MountOptions> for MountCommands {
             }));
         }
 
-        if let Some(proc_path) = opts.proc {
+        if let Some(proc_path) = self.proc {
             ops.push(MountCommand::Mount(MountOp::Special(SpecialMount::Proc(
                 proc_path,
             ))));
         }
 
-        if let Some(dev_path) = opts.dev {
+        if let Some(dev_path) = self.dev {
             ops.push(MountCommand::Mount(MountOp::Special(SpecialMount::Dev(
                 dev_path,
             ))));
         }
 
-        if let Some(tmpfs_path) = opts.tmpfs {
+        if let Some(tmpfs_path) = self.tmpfs {
             ops.push(MountCommand::Mount(MountOp::Special(SpecialMount::Tmpfs {
                 target: tmpfs_path,
-                size_kb: opts.size.map(|s| (s.0 / 1024) as usize),
-                mode: opts.perms.map(|p| p.0),
+                size_kb: self.size.map(|s| (s.0 / 1024) as usize),
+                mode: self.perms.map(|p| p.0),
             })));
         }
 
-        if let Some(mqueue_path) = opts.mqueue {
+        if let Some(mqueue_path) = self.mqueue {
             ops.push(MountCommand::Mount(MountOp::Special(SpecialMount::Mqueue(
                 mqueue_path,
             ))));
         }
 
         // Handle file operations
-        if let Some(dir) = opts.dir {
+        if let Some(dir) = self.dir {
             ops.push(MountCommand::File(FileOp::CreateDir(dir)));
         }
 
-        for pair in opts.file {
+        for pair in self.file {
             ops.push(MountCommand::File(FileOp::CreateFile {
                 fd: pair.fd,
                 dest: pair.destination,
             }));
         }
 
-        if let Some(symlink) = opts.symlink {
+        for symlink in self.symlink {
             ops.push(MountCommand::File(FileOp::CreateSymlink {
                 link_path: symlink.destination,
                 target: symlink.source,
             }));
         }
 
-        if let Some(remount_path) = opts.remount_ro {
+        if let Some(remount_path) = self.remount_ro {
             ops.push(MountCommand::File(FileOp::RemountReadOnly(remount_path)));
         }
 
         // Handle system operations
-        for chmod_pair in opts.chmod {
+        for chmod_pair in self.chmod {
             ops.push(MountCommand::System(SystemOp::Chmod {
                 path: chmod_pair.path,
                 mode: chmod_pair.permissions,
@@ -597,93 +609,7 @@ impl From<MountOptions> for MountCommands {
     }
 }
 
-pub type MountCommands = Vec<MountCommand>;
-
-#[derive(Debug, Decode, Encode)]
-pub enum MountCommand {
-    Mount(MountOp),
-    File(FileOp),
-    System(SystemOp),
-}
-
-/// Types of mount operations.
-#[derive(Debug, Decode, Encode)]
-pub enum MountOp {
-    Bind {
-        source: PathBuf,
-        target: PathBuf,
-        options: BindOptions,
-    },
-    Overlay {
-        lowerdir: PathBuf,
-        upperdir: Option<PathBuf>,
-        workdir: Option<PathBuf>,
-        target: PathBuf,
-        mode: OverlayMode,
-    },
-    Special(SpecialMount),
-}
-
-/// Special filesystem mounts like proc, tmpfs, etc.
-#[derive(Debug, Decode, Encode)]
-pub enum SpecialMount {
-    Proc(PathBuf),
-    Dev(PathBuf),
-    Tmpfs {
-        target: PathBuf,
-        size_kb: Option<usize>,
-        mode: Option<u32>,
-    },
-    Mqueue(PathBuf),
-    OverlaySource {
-        lowerdir: PathBuf,
-        upperdir: PathBuf,
-        workdir: PathBuf,
-    },
-}
-
-/// Mount options for bind mounts.
-#[derive(Debug, Default, Decode, Encode)]
-pub struct BindOptions {
-    pub readonly: bool,
-    pub mount_dev: bool,
-}
-
-/// Overlay mount mode: readonly or read-write.
-#[derive(Debug, Decode, Encode)]
-pub enum OverlayMode {
-    ReadOnly,
-    ReadWrite,
-}
-
-/// Filesystem operations.
-#[derive(Debug, Decode, Encode)]
-pub enum FileOp {
-    CreateDir(PathBuf),
-    CreateFile {
-        fd: i32,
-        dest: PathBuf,
-    },
-    CreateBindFile {
-        source: PathBuf,
-        dest: PathBuf,
-        readonly: bool,
-    },
-    CreateSymlink {
-        link_path: PathBuf,
-        target: PathBuf,
-    },
-    RemountReadOnly(PathBuf),
-}
-
-/// System-level configuration operations.
-#[derive(Debug, Decode, Encode)]
-pub enum SystemOp {
-    SetHostname(String),
-    Chmod { path: PathBuf, mode: u32 },
-}
-
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct EnvOptions {
     #[arg(
         long,
@@ -715,7 +641,7 @@ pub struct EnvOptions {
     pub unsetenv: Vec<String>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct DebugOptions {
     #[arg(long, help="For debugging CLI arguments", help_heading = HEADING_DEBUG)]
     pub cli_args: bool,
