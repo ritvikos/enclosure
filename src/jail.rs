@@ -1,117 +1,142 @@
 use crate::{
     capabilities::CapabilityManager,
     config::Config,
-    context::GlobalContext,
-    hardener::{self, IdMapWriter},
-    jailer::{HostResource, Jailable},
-    utils,
+    context::{Child, ProcessContext},
+    jailer::HostResource,
+    mount::{MountContext, PivotContext},
+    utils::{IdentityMap, SelfWriter},
 };
 use anyhow::Result;
 use nix::unistd::{Gid, Uid, execvp};
-use std::ffi::CString;
+use std::{ffi::CString, marker::PhantomData, path::Path};
+
+mod sealed {
+    pub trait Sealed {}
+}
 
 const BASE_PATH: &str = "/tmp";
 const NEW_ROOT: &str = "newroot";
 const OLD_ROOT: &str = "oldroot";
 
-pub struct Jail<'jail> {
-    pub config: &'jail Config,
-    pub resource: HostResource<'jail>,
+impl sealed::Sealed for AwaitingPrivileges {}
+impl sealed::Sealed for Privileged {}
+impl sealed::Sealed for Isolated {}
+impl sealed::Sealed for Restricted {}
+impl sealed::Sealed for Executed {}
+
+pub struct AwaitingPrivileges;
+pub struct Privileged;
+pub struct Isolated;
+pub struct Restricted;
+pub struct Executed;
+
+pub struct Jail<'resource, State: sealed::Sealed> {
+    config: Config,
+    resource: HostResource<'resource>,
+    _state: PhantomData<State>,
 }
 
-impl Jail<'_> {
-    fn setup_privileges(&self, setuid: bool) -> Result<()> {
-        if self.config.namespace.unshare_user {
-            CapabilityManager::drop_all_bounding_capabilities()?;
+impl<'resource> Jail<'resource, AwaitingPrivileges> {
+    pub fn new(config: Config, resource: HostResource<'resource>) -> Self {
+        Self {
+            config,
+            resource,
+            _state: PhantomData,
         }
-
-        if !setuid {
-            return Ok(());
-        }
-
-        Ok(())
-    }
-}
-
-impl<'a> Jailable<'a> for Jail<'a> {
-    fn new(config: &'a Config, resource: HostResource<'a>) -> Self {
-        Self { config, resource }
     }
 
-    fn config(&self) -> &Config {
-        self.config
+    pub fn setup_privileges(self) -> Result<Jail<'resource, Privileged>> {
+        self.write_mappings()?;
+
+        Ok(Jail {
+            config: self.config,
+            resource: self.resource,
+            _state: PhantomData,
+        })
     }
 
-    fn resource(&self) -> &HostResource<'a> {
-        &self.resource
-    }
+    fn write_mappings(&self) -> Result<()> {
+        let child = unsafe { ProcessContext::<Child>::get() };
+        // SAFETY: parent context is initialized at startup before clone()
+        let parent = unsafe { child.parent() };
 
-    fn prepare(&self, parent_context: &GlobalContext) -> Result<()> {
-        let namespace_uid = match self.config.user.uid {
-            Some(uid) => Uid::from(uid),
-            None => parent_context.ruid(),
-        };
+        if !parent.setuid() && self.config.namespace.unshare_user {
+            let namespace_uid = match self.config.user.uid {
+                Some(uid) => Uid::from(uid),
+                None => Uid::from_raw(0),
+            };
 
-        let namespace_gid = match self.config.user.gid {
-            Some(gid) => Gid::from(gid),
-            None => parent_context.guid(),
-        };
+            let namespace_gid = match self.config.user.gid {
+                Some(gid) => Gid::from(gid),
+                None => Gid::from_raw(0),
+            };
 
-        let ruid = parent_context.ruid();
-        let guid = parent_context.guid();
-
-        let overflow_ids = parent_context.overflow_ids();
-        let parent_setuid = parent_context.setuid();
-
-        if !parent_context.setuid() && self.config.namespace.unshare_user {
-            let writer = IdMapWriter::new(
+            let map = IdentityMap::new(
                 namespace_uid,
                 namespace_gid,
-                ruid,
-                guid,
-                overflow_ids,
-                true,
-                false,
-                None,
+                parent.ruid(),
+                parent.guid(),
+                parent.overflow_ids(),
             );
 
+            let writer = SelfWriter::new(map);
             writer.write(self.resource.proc_fd())?;
             println!("[CHILD]: Wrote Mappings");
         }
 
-        GlobalContext::init()?;
-
-        self.setup_privileges(parent_setuid)?;
-
-        // TODO: Resolve symlinks
-
-        // Handle mount propagation
-        hardener::set_mounts_slave_recursive()?;
-
-        // Mount tmpfs at '/tmp'
-        hardener::set_tmpfs(BASE_PATH)?;
-
-        // We are in '/tmp'
-        hardener::chdir(BASE_PATH)?;
-
-        // We have '/tmp/newroot'
-        utils::create_directory(NEW_ROOT, 0o755)?;
-
-        hardener::bind_mount_self(NEW_ROOT)?;
-
-        // We have '/tmp/oldroot'
-        utils::create_directory(OLD_ROOT, 0o755)?;
-
-        hardener::pivot_root(BASE_PATH, OLD_ROOT)?;
-
-        // Change the working directory to the new root ('/'),
-        // which should now be 'BASE_PATH'.
-        hardener::chdir("/")?;
-
         Ok(())
     }
+}
 
-    fn execute(&self) -> Result<isize> {
+impl<'resource> Jail<'resource, Privileged> {
+    pub fn isolate(mut self) -> Result<Jail<'resource, Isolated>> {
+        let pivot_ctx =
+            PivotContext::<crate::mount::Uninitialized>::new(BASE_PATH, NEW_ROOT, OLD_ROOT)?
+                .enslave_and_mount()?
+                .bind_new_root()?
+                .first_pivot()?;
+
+        let ctx = MountContext {
+            root: Path::new("/newroot"),
+            unshare_pid: self.config.namespace.unshare_pid
+                || self.config.namespace.unshare_all
+                || self.config.user.pidns.is_some(),
+        };
+
+        for command in &mut self.config.mount_commands {
+            command.resolve_paths()?;
+            command.apply(&ctx)?;
+        }
+
+        pivot_ctx
+            .detach_old_root()?
+            .second_pivot()?
+            .detach_staging()?;
+
+        Ok(Jail {
+            config: self.config,
+            resource: self.resource.clone(),
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<'resource> Jail<'resource, Isolated> {
+    pub fn restrict(self) -> Result<Jail<'resource, Restricted>> {
+        if self.config.namespace.unshare_user {
+            CapabilityManager::drop_all_bounding_capabilities()?;
+        }
+
+        Ok(Jail {
+            config: self.config,
+            resource: self.resource.clone(),
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<'resource> Jail<'resource, Restricted> {
+    pub fn execute(self) -> Result<isize> {
         let file = CString::new(self.config.executable.to_string_lossy().as_bytes())?;
 
         let args: Vec<_> = std::iter::once(&self.config.executable)
@@ -127,9 +152,5 @@ impl<'a> Jailable<'a> for Jail<'a> {
         execvp(&file, &args)?;
 
         Ok(0)
-    }
-
-    fn cleanup(&self) -> Result<()> {
-        Ok(())
     }
 }
