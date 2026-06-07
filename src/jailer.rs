@@ -1,90 +1,142 @@
 use crate::{
-    config::Config, context::GlobalContext, notifier::Notifier, report::ErrorReporter,
+    context::{Child, ProcessContext},
+    jail::{self, Jail},
+    notifier::{NotifierReceiver, NotifierSender, notifier_pair},
+    report::ErrorReporter,
     stack::GuardedStack,
 };
 use anyhow::{Context, Result, anyhow};
 use nix::{
-    sched::{CloneCb, CloneFlags, clone},
+    sched::{CloneFlags, clone},
     sys::{
         signal::{
             Signal::{self, SIGKILL},
             kill,
         },
-        wait::{WaitPidFlag, WaitStatus, waitpid},
+        wait::{WaitStatus, waitpid},
     },
     unistd::Pid,
 };
-use std::{cell::Cell, marker::PhantomData, os::fd::BorrowedFd};
+use std::os::fd::BorrowedFd;
 
-pub struct JailerBuilder<'builder, C: Jailable<'builder>> {
-    target: C,
-    notifier: Notifier,
-    report: ErrorReporter,
-    stack_bytes: usize,
-    _marker: PhantomData<&'builder ()>,
+mod sealed {
+    pub trait Sealed {}
 }
 
-impl<'builder, C: Jailable<'builder>> JailerBuilder<'builder, C> {
-    pub fn new(target: C) -> Result<Self> {
-        let notifier = Notifier::new()?;
-        let report = ErrorReporter::new()?;
+pub struct Configured;
+pub struct Prepared {
+    pub(super) flags: CloneFlags,
+}
+pub struct Forked {
+    pub(super) pid: Pid,
+    pub(super) sender: NotifierSender,
+}
 
-        Ok(Self {
-            notifier,
-            stack_bytes: 1024 * 1024,
+pub struct Running;
+pub struct Terminated {
+    pub(super) code: i32,
+}
+
+impl sealed::Sealed for Configured {}
+impl sealed::Sealed for Prepared {}
+impl sealed::Sealed for Running {}
+impl sealed::Sealed for Terminated {}
+impl sealed::Sealed for Forked {}
+
+struct ChildContext<'resource> {
+    target: Jail<'resource, jail::AwaitingPrivileges>,
+    report: ErrorReporter,
+    notifier: NotifierReceiver,
+}
+
+impl ChildContext<'_> {
+    fn run(self) -> Result<isize> {
+        self.notifier.wait_for_signal()?;
+        ProcessContext::<Child>::init_child()?;
+
+        let response = self
+            .target
+            .setup_privileges()
+            .context("Privilege setup phase failed")?
+            .isolate()
+            .context("Isolation phase failed")?
+            .restrict()
+            .context("Restriction phase failed")?
+            .execute()
+            .context("Execution phase failed")?;
+
+        self.report.check_for_reported_errors()?;
+
+        Ok(response)
+    }
+}
+
+pub struct Jailer<'resource, S: sealed::Sealed = Configured> {
+    target: Jail<'resource, jail::AwaitingPrivileges>,
+    report: ErrorReporter,
+    stack_bytes: usize,
+    state: S,
+}
+
+impl<'resource> Jailer<'resource, Configured> {
+    pub fn new(target: Jail<'resource, jail::AwaitingPrivileges>) -> Self {
+        Self {
             target,
-            report,
-            _marker: PhantomData,
-        })
+            report: ErrorReporter::new().expect("Failed to create error reporter"),
+            stack_bytes: 1024 * 1024,
+            state: Configured,
+        }
     }
 
-    pub fn with_stack_size(mut self, stack_size: usize) -> Self {
-        self.stack_bytes = stack_size;
-        self
-    }
-
-    pub fn build(self) -> Jailer<'builder, C> {
-        assert!(self.stack_bytes >= 64 * 1024, "stack size too small");
-
+    pub fn with_clone_flags(self, flags: CloneFlags) -> Jailer<'resource, Prepared> {
         Jailer {
-            context: GlobalContext::current(),
-            notifier: self.notifier,
             target: self.target,
             report: self.report,
             stack_bytes: self.stack_bytes,
-            _marker: PhantomData,
+            state: Prepared { flags },
         }
     }
+
+    pub fn with_stack_bytes(mut self, bytes: usize) -> Self {
+        self.stack_bytes = bytes;
+        self
+    }
 }
 
-pub struct Jailer<'jailer, C: Jailable<'jailer>> {
-    target: C,
-    notifier: Notifier,
-    report: ErrorReporter,
-    stack_bytes: usize,
-    context: GlobalContext,
-    _marker: PhantomData<&'jailer ()>,
-}
+impl<'resource> Jailer<'resource, Prepared> {
+    pub fn spawn(self) -> Result<StagedJail> {
+        let Jailer {
+            target,
+            report,
+            stack_bytes,
+            ..
+        } = self;
 
-impl<'jailer, C: Jailable<'jailer>> Jailer<'jailer, C> {
-    pub fn spawn_blocking(&self, flags: CloneFlags) -> Result<JailHandle> {
-        let callback = self.create_child_callback();
-        let guard = self.spawn_child(callback, flags)?;
-        Ok(guard)
-    }
+        let (sender, receiver) = notifier_pair()?;
 
-    fn create_child_callback(&self) -> Box<impl FnMut() -> isize> {
-        Box::new(|| match self.child_main() {
-            Ok(code) => return code,
-            Err(error) => {
-                eprintln!("Child process error: {:?}", error);
-                return 1;
-            }
-        })
-    }
+        let child_ctx = ChildContext {
+            target,
+            report,
+            notifier: receiver,
+        };
 
-    fn spawn_child(&self, callback: CloneCb, flags: CloneFlags) -> Result<JailHandle> {
-        let mut stack = GuardedStack::new(self.stack_bytes)?;
+        let mut stack = GuardedStack::new(stack_bytes)?;
+        let mut child_ctx = Some(child_ctx);
+        let callback = {
+            Box::new(move || {
+                let ctx = child_ctx
+                    .take()
+                    .expect("Child context should only be used once");
+
+                match ctx.run() {
+                    Ok(code) => code,
+                    Err(e) => {
+                        eprintln!("Child process error: {:#}", e);
+                        1
+                    }
+                }
+            })
+        };
 
         println!("[PARENT]: Spawning child process with clone");
 
@@ -92,167 +144,93 @@ impl<'jailer, C: Jailable<'jailer>> Jailer<'jailer, C> {
             clone(
                 Box::new(callback),
                 stack.as_mut_slice(),
-                flags,
+                self.state.flags,
                 Some(Signal::SIGCHLD as i32),
             )
         }?;
 
-        Ok(JailHandle::new(pid, &self.notifier))
-    }
-
-    fn child_main(&self) -> Result<isize> {
-        // Wait for the parent's signal to continue execution
-        self.notifier.wait_for_signal()?;
-
-        // Prepare the child's execution environment
-        self.target.prepare(&self.context)?;
-
-        // Execute the process
-        self.target.execute()?;
-
-        // Cleanup
-        self.target.cleanup()?;
-
-        // Check for reported errors from the child (if any)
-        self.report.check_for_reported_errors()?;
-
-        // TODO: Return the exit code from the child process
-        Ok(0)
+        Ok(StagedJail { pid, sender })
     }
 }
 
-pub struct JailHandle<'handle> {
-    /// PID of the child process
+pub struct StagedJail {
     pid: Pid,
-
-    /// Signals the child process to execute
-    notifier: &'handle Notifier,
-
-    // Track if the process has been waited on
-    waited: Cell<bool>,
+    sender: NotifierSender,
 }
 
-impl<'handle> JailHandle<'handle> {
-    #[inline]
-    fn new(pid: Pid, notifier: &'handle Notifier) -> Self {
-        Self {
-            pid,
-            notifier,
-            waited: Cell::new(false),
-        }
-    }
+impl StagedJail {
+    pub fn finalize(self) -> Result<JailHandle<Running>> {
+        /*
+        let map = IdentityMap::new(sandbox_uid, sandbox_gid, host_uid, host_gid, overflow);
 
+        ExternalWriter::new(self.pid, map)
+            .write(host.proc_fd())
+            .with_context(|| format!("Failed to write userns maps for pid {}", self.pid))?;
+
+        todo!()
+        */
+
+        Ok(JailHandle {
+            pid: self.pid,
+            notifier: self.sender,
+            state: Running,
+        })
+    }
+}
+
+pub struct JailHandle<S: sealed::Sealed = Running> {
+    pid: Pid,
+    notifier: NotifierSender,
+    state: S,
+}
+
+impl JailHandle<Running> {
     #[inline]
     pub fn pid(&self) -> Pid {
         self.pid
     }
 
-    // Setup the parent once child process is spawned
-    pub fn execute<P>(&self, parent: P) -> Result<i32>
-    where
-        P: FnOnce() -> Result<()>,
-    {
-        parent().context("Parent setup failed")?;
-
+    pub fn resume(self) -> Result<ExitHandler> {
         self.notifier
             .signal()
             .context("Failed to unblock child process")?;
 
-        self.wait()
+        Ok(ExitHandler { pid: self.pid })
     }
+}
 
-    pub fn wait(&self) -> Result<i32> {
-        let status = waitpid(self.pid, None)
-            .with_context(|| format!("Failed to wait for process {}", self.pid))?;
+pub struct ExitHandler {
+    pid: Pid,
+}
 
-        self.waited.set(true);
-
-        match status {
+impl ExitHandler {
+    pub fn wait(self) -> Result<i32> {
+        match waitpid(self.pid, None)
+            .with_context(|| format!("Failed to wait for process {}", self.pid))?
+        {
             WaitStatus::Exited(_, code) => Ok(code),
             WaitStatus::Signaled(_, signal, _) => {
                 Err(anyhow!("Child process killed by signal: {:?}", signal))
             }
-            _ => Err(anyhow!("Unexpected wait status: {:?}", status)),
+            status => Err(anyhow!("Unexpected wait status: {:?}", status)),
         }
     }
 
-    pub fn terminate(&self) -> Result<()> {
-        if self.has_waited() {
-            return Ok(());
-        }
+    pub fn kill(self) -> Result<i32> {
+        kill(self.pid, SIGKILL)
+            .with_context(|| format!("Failed to kill process {} with SIGKILL", self.pid))?;
 
-        if self.try_wait()?.is_some() {
-            return Ok(());
-        }
-
-        let signal = SIGKILL;
-
-        kill(self.pid, signal).with_context(|| {
-            format!(
-                "Failed to terminate process {} with signal {}",
-                self.pid, signal
-            )
-        })?;
-
-        Ok(())
-    }
-
-    fn try_wait(&self) -> Result<Option<i32>> {
-        if self.has_waited() {
-            return Ok(None);
-        }
-
-        match waitpid(self.pid, Some(WaitPidFlag::WNOHANG))
-            .with_context(|| format!("Failed to check status of process {}", self.pid))?
-        {
-            WaitStatus::Exited(_, code) => {
-                self.waited.set(true);
-                Ok(Some(code))
-            }
-            WaitStatus::Signaled(_, signal, _) => {
-                self.waited.set(true);
-                Err(anyhow!(
-                    "Child process {} killed by signal: {:?}",
-                    self.pid,
-                    signal
-                ))
-            }
-            WaitStatus::StillAlive => Ok(None),
-            _ => Ok(None),
-        }
-    }
-
-    #[inline]
-    fn has_waited(&self) -> bool {
-        self.waited.get()
-    }
-}
-
-impl Drop for JailHandle<'_> {
-    fn drop(&mut self) {
-        if !self.waited.get() {
-            match self.try_wait() {
-                Ok(None) => {
-                    eprintln!(
-                        "Warning: JailHandle dropped while child process {} is still running. \
-                         Consider calling wait_for_completion() or terminate_child() explicitly.",
-                        self.pid
-                    );
+        return {
+            match waitpid(self.pid, None)
+                .with_context(|| format!("Failed to wait for process {}", self.pid))?
+            {
+                WaitStatus::Exited(_, code) => Ok(code),
+                WaitStatus::Signaled(_, signal, _) => {
+                    Err(anyhow!("Child process killed by signal: {:?}", signal))
                 }
-                Ok(Some(exit_code)) => {
-                    eprintln!(
-                        "Info: Child process {} exited with code {} during JailHandle drop",
-                        self.pid, exit_code
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to check status of child process {} during drop: {}",
-                        self.pid, e
-                    );
-                }
+                status => Err(anyhow!("Unexpected wait status: {:?}", status)),
             }
-        }
+        };
     }
 }
 
@@ -271,12 +249,8 @@ impl<'resource> HostResource<'resource> {
     }
 }
 
-pub trait Jailable<'jail> {
-    fn config(&self) -> &Config;
-    fn resource(&self) -> &HostResource<'jail>;
-
-    fn new(config: &'jail Config, resource: HostResource<'jail>) -> Self;
-    fn prepare(&self, parent_context: &GlobalContext) -> Result<()>;
-    fn execute(&self) -> Result<isize>;
-    fn cleanup(&self) -> Result<()>;
+impl Clone for HostResource<'_> {
+    fn clone(&self) -> Self {
+        Self::new(self.proc_fd)
+    }
 }
