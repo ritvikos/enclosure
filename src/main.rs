@@ -8,13 +8,11 @@
 mod capabilities;
 mod config;
 mod context;
+mod ipc;
 mod jail;
 mod jailer;
 mod mount;
-mod notifier;
-mod report;
 mod sandbox;
-mod stack;
 mod utils;
 
 use clap::Parser;

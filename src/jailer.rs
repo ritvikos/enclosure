@@ -1,9 +1,11 @@
 use crate::{
     context::{Child, ProcessContext},
+    ipc::{
+        notifier::{NotifierReceiver, NotifierSender, notifier_pair},
+        reporter::ErrorReporter,
+    },
     jail::{self, Jail},
-    notifier::{NotifierReceiver, NotifierSender, notifier_pair},
-    report::ErrorReporter,
-    stack::GuardedStack,
+    utils::GuardedStack,
 };
 use anyhow::{Context, Result, anyhow};
 use nix::{
