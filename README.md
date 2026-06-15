@@ -52,14 +52,15 @@ cargo build
 cargo run -- \
   --unshare-user \
   --unshare-pid \
-  --bind "/usr /usr" \
-  --symlink "usr/bin /bin" \
-  --symlink "usr/lib64 /lib64" \
-  --symlink "usr/lib /lib" \
-  --proc /proc \
-  --dev /dev \
-  --dir /tmp \
-  -- /bin/sh
+  --mount dev:/dev \
+  --mount proc:/proc \
+  --mount bind:/usr:/usr,rw \
+  --mount symlink:usr/bin:/usr/bin \
+  --mount symlink:usr/lib64:/lib64 \
+  --mount symlink:usr/lib:/lib \
+  --mount dir:/dir-mnt,mode=700 \
+  --mount file:fd=2:/file-mnt,mode=700 \
+  /bin/sh
 ```
 
 > **Note:** Symlinks aren't resolved automatically yet, pass explicitly via `--symlink`.
