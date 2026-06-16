@@ -1,14 +1,20 @@
 use crate::{
     capabilities::CapabilityManager,
-    config::Config,
+    config::{Config, MountEntry},
     context::{Child, ProcessContext},
     jailer::HostResource,
-    mount::{MountContext, PivotContext},
-    utils::{IdentityMap, SelfWriter},
+    mount::{
+        MountContext,
+        pivot::{PivotContext, Uninitialized},
+    },
+    utils::{self, IdentityMap, SelfWriter},
 };
-use anyhow::Result;
-use nix::unistd::{Gid, Uid, execvp};
-use std::{ffi::CString, marker::PhantomData, path::Path};
+use anyhow::{Context, Result};
+use nix::{
+    mount::{MsFlags, mount},
+    unistd::{Gid, Uid, execvp},
+};
+use std::{ffi::CString, marker::PhantomData, os::unix::fs::symlink};
 
 mod sealed {
     pub trait Sealed {}
@@ -89,33 +95,23 @@ impl<'resource> Jail<'resource, AwaitingPrivileges> {
 }
 
 impl<'resource> Jail<'resource, Privileged> {
-    pub fn isolate(mut self) -> Result<Jail<'resource, Isolated>> {
-        let pivot_ctx =
-            PivotContext::<crate::mount::Uninitialized>::new(BASE_PATH, NEW_ROOT, OLD_ROOT)?
-                .enslave_and_mount()?
-                .bind_new_root()?
-                .first_pivot()?;
-
-        let ctx = MountContext {
-            root: Path::new("/newroot"),
-            unshare_pid: self.config.namespace.unshare_pid
-                || self.config.namespace.unshare_all
-                || self.config.user.pidns.is_some(),
-        };
-
-        for command in &mut self.config.mount_commands {
-            command.resolve_paths()?;
-            command.apply(&ctx)?;
-        }
-
-        pivot_ctx
+    pub fn isolate(self) -> Result<Jail<'resource, Isolated>> {
+        PivotContext::<Uninitialized>::new(BASE_PATH, NEW_ROOT, OLD_ROOT)?
+            .enslave_and_mount()?
+            .bind_new_root()?
+            .first_pivot()?
+            .stage(
+                |oldroot_abs /* '/oldroot' */, newroot_abs /* '/newroot' */| {
+                    todo!("WIP: `MountContext` abstraction in src/mount.rs")
+                },
+            )?
             .detach_old_root()?
             .second_pivot()?
             .detach_staging()?;
 
         Ok(Jail {
             config: self.config,
-            resource: self.resource.clone(),
+            resource: self.resource,
             _state: PhantomData,
         })
     }
