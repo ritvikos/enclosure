@@ -1,20 +1,17 @@
 use crate::{
     capabilities::CapabilityManager,
-    config::{Config, MountEntry},
+    config::Config,
     context::{Child, ProcessContext},
     jailer::HostResource,
     mount::{
         MountContext,
         pivot::{PivotContext, Uninitialized},
     },
-    utils::{self, IdentityMap, SelfWriter},
+    utils::{IdentityMap, SelfWriter},
 };
-use anyhow::{Context, Result};
-use nix::{
-    mount::{MsFlags, mount},
-    unistd::{Gid, Uid, execvp},
-};
-use std::{ffi::CString, marker::PhantomData, os::unix::fs::symlink};
+use anyhow::Result;
+use nix::unistd::{Gid, Uid, execvp};
+use std::{ffi::CString, marker::PhantomData};
 
 mod sealed {
     pub trait Sealed {}
@@ -102,7 +99,13 @@ impl<'resource> Jail<'resource, Privileged> {
             .first_pivot()?
             .stage(
                 |oldroot_abs /* '/oldroot' */, newroot_abs /* '/newroot' */| {
-                    todo!("WIP: `MountContext` abstraction in src/mount.rs")
+                    MountContext::new(
+                        &self.config.mount,
+                        &self.config.namespace,
+                        oldroot_abs,
+                        newroot_abs,
+                    )
+                    .apply()
                 },
             )?
             .detach_old_root()?

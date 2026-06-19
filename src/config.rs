@@ -1,7 +1,4 @@
-pub use crate::{
-    mount::{BindOptions, FileOp, MountCommand, MountOp, SpecialMount, SystemOp},
-    utils::{is_fd_valid, is_namespace_supported},
-};
+pub use crate::utils::{is_fd_valid, is_namespace_supported};
 use anyhow::{Error, Result, anyhow};
 use clap::{ArgGroup, Args, Parser};
 use nix::sched::CloneFlags;
@@ -33,8 +30,6 @@ pub struct Config {
     #[command(flatten)]
     pub user: UserOptions,
 
-    // #[command(flatten)]
-    // pub mount: MountOptions,
     #[arg(long, value_parser = MountEntry::from_str)]
     pub mount: Vec<MountEntry>,
 
@@ -239,7 +234,7 @@ pub struct UserOptions {
 
     #[arg(
         long,
-        help = "Customm hostname",
+        help = "Set custom hostname (requires --unshare-uts)",
         requires = "unshare_uts",
         help_heading = HEADING_USER,
     )]
@@ -538,8 +533,8 @@ impl MountParser for FileMount {
             .ok_or_else(|| Self::err_syntax("missing fd / destination"))
             .and_then(|(fd, rest)| match (fd.trim(), rest.trim()) {
                 ("", _) => return Err(Self::err_syntax("fd cannot be empty")),
-                (fd, "") => return Err(Self::err_syntax("destination cannot be empty")),
-                (fd, rest) if !fd.starts_with(FD_PREFIX) => {
+                (_, "") => return Err(Self::err_syntax("destination cannot be empty")),
+                (fd, _) if !fd.starts_with(FD_PREFIX) => {
                     return Err(Self::err_syntax("fd must start with 'fd='"));
                 }
                 (fd, rest) => Ok((
@@ -599,7 +594,7 @@ impl MountParser for OverlayMount {
     const KIND: &'static str = "overlay";
     const SYNTAX: &'static str = "overlay:<dest>,lowerdir=<path>[,upperdir=<path>,workdir=<path>]";
 
-    fn parse(rest: &str) -> Result<MountEntry, ParseMountError> {
+    fn parse(_rest: &str) -> Result<MountEntry, ParseMountError> {
         todo!()
     }
 }
@@ -671,139 +666,9 @@ impl MountParser for TmpfsMount {
     const KIND: &'static str = "tmpfs";
     const SYNTAX: &'static str = "tmpfs:<dest>[,size=<N>][,mode=<octal>]";
 
-    fn parse(rest: &str) -> Result<MountEntry, ParseMountError> {
+    fn parse(_rest: &str) -> Result<MountEntry, ParseMountError> {
         todo!()
     }
-}
-
-#[derive(Args, Debug, Clone, Default)]
-pub struct MountOptions {
-    /// Base directory for mount operations
-    #[arg(
-        long,
-        default_value = "/tmp",
-        help_heading = HEADING_MOUNT,
-        value_hint = clap::ValueHint::DirPath
-    )]
-    pub base: PathBuf,
-
-    #[arg(
-        long,
-        value_parser = PathPair::from_str,
-        help_heading = HEADING_MOUNT
-    )]
-    pub bind: Vec<PathPair>,
-
-    /// Bind mount with device access
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT
-    )]
-    pub dev_bind: Vec<PathPair>,
-
-    /// Read-only bind mount
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT
-    )]
-    pub ro_bind: Vec<PathPair>,
-
-    /// Bind mount from file descriptor (FD DEST pairs)
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT
-    )]
-    pub bind_fd: Vec<FdPathPair>,
-
-    /// Read-only bind mount from file descriptor (FD DEST pairs)
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT
-    )]
-    pub ro_bind_fd: Vec<FdPathPair>,
-
-    /// Remount paths as read-only
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT,
-        value_hint = clap::ValueHint::DirPath
-    )]
-    pub remount_ro: Option<PathBuf>,
-
-    /// Mount procfs at specified path
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT,
-        value_hint = clap::ValueHint::DirPath
-    )]
-    pub proc: Option<PathBuf>,
-
-    /// Mount devfs at specified path
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT,
-        value_hint = clap::ValueHint::DirPath
-    )]
-    pub dev: Option<PathBuf>,
-
-    /// Mount tmpfs at specified path
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT,
-        value_hint = clap::ValueHint::DirPath
-    )]
-    pub tmpfs: Option<PathBuf>,
-
-    /// Mount message queue filesystem at specified path
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT,
-        value_hint = clap::ValueHint::DirPath
-    )]
-    pub mqueue: Option<PathBuf>,
-
-    /// Create directories
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT,
-        value_hint = clap::ValueHint::DirPath
-    )]
-    pub dir: Option<PathBuf>,
-
-    /// Create files from file descriptor (FD DEST pairs)
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT
-    )]
-    pub file: Vec<FdPathPair>,
-
-    /// Create symbolic links
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT
-    )]
-    pub symlink: Vec<PathPair>,
-
-    /// Set default permissions (octal format, e.g., 755)
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT
-    )]
-    pub perms: Option<OctalPermissions>,
-
-    /// Set tmpfs size (e.g., 100M, 1G)
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT
-    )]
-    pub size: Option<Size>,
-
-    /// Change file permissions (OCTAL PATH pairs)
-    #[arg(
-        long,
-        help_heading = HEADING_MOUNT
-    )]
-    pub chmod: Vec<ChmodPair>,
 }
 
 /// Represents a source-destination path pair
@@ -892,15 +757,28 @@ impl std::str::FromStr for ChmodPair {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct OctalPermissions(pub u32);
+pub struct OctalPermissions(u32);
 
 impl std::str::FromStr for OctalPermissions {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        u32::from_str_radix(s, 8)
-            .map(OctalPermissions)
-            .map_err(|_| format!("invalid octal permissions: '{}'", s))
+        let value =
+            u32::from_str_radix(s, 8).map_err(|_| format!("invalid octal permissions: '{}'", s))?;
+
+        if value < 0 || value > 0o7777 {
+            return Err(format!("octal permissions out-of-range (0-0777): '{}'", s));
+        }
+
+        Ok(OctalPermissions(value))
+    }
+}
+
+impl std::ops::Deref for OctalPermissions {
+    type Target = u32;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
@@ -932,106 +810,6 @@ impl std::str::FromStr for Size {
                 .map(Size)
                 .map_err(|_| format!("Invalid size format: '{}'", s))
         }
-    }
-}
-
-pub type MountCommands = Vec<MountCommand>;
-
-impl MountOptions {
-    pub fn into_commands(self) -> MountCommands {
-        let mut ops = Vec::new();
-
-        for bind in self.bind {
-            ops.push(MountCommand::Mount(MountOp::Bind {
-                source: bind.source,
-                target: bind.destination,
-                options: BindOptions {
-                    readonly: false,
-                    mount_dev: false,
-                },
-            }));
-        }
-
-        for dev_bind in self.dev_bind {
-            ops.push(MountCommand::Mount(MountOp::Bind {
-                source: dev_bind.source,
-                target: dev_bind.destination,
-                options: BindOptions {
-                    readonly: false,
-                    mount_dev: true,
-                },
-            }));
-        }
-
-        for ro_bind in self.ro_bind {
-            ops.push(MountCommand::Mount(MountOp::Bind {
-                source: ro_bind.source,
-                target: ro_bind.destination,
-                options: BindOptions {
-                    readonly: true,
-                    mount_dev: false,
-                },
-            }));
-        }
-
-        if let Some(proc_path) = self.proc {
-            ops.push(MountCommand::Mount(MountOp::Special(SpecialMount::Proc(
-                proc_path,
-            ))));
-        }
-
-        if let Some(dev_path) = self.dev {
-            ops.push(MountCommand::Mount(MountOp::Special(SpecialMount::Dev(
-                dev_path,
-            ))));
-        }
-
-        if let Some(tmpfs_path) = self.tmpfs {
-            ops.push(MountCommand::Mount(MountOp::Special(SpecialMount::Tmpfs {
-                target: tmpfs_path,
-                size_kb: self.size.map(|s| (s.0 / 1024) as usize),
-                mode: self.perms.map(|p| p.0),
-            })));
-        }
-
-        if let Some(mqueue_path) = self.mqueue {
-            ops.push(MountCommand::Mount(MountOp::Special(SpecialMount::Mqueue(
-                mqueue_path,
-            ))));
-        }
-
-        // Handle file operations
-        if let Some(dir) = self.dir {
-            ops.push(MountCommand::File(FileOp::CreateDir(dir)));
-        }
-
-        for pair in self.file {
-            ops.push(MountCommand::File(FileOp::CreateFile {
-                fd: pair.fd,
-                dest: pair.destination,
-            }));
-        }
-
-        for symlink in self.symlink {
-            ops.push(MountCommand::File(FileOp::CreateSymlink {
-                link_path: symlink.destination,
-                target: symlink.source,
-            }));
-        }
-
-        if let Some(remount_path) = self.remount_ro {
-            ops.push(MountCommand::File(FileOp::RemountReadOnly(remount_path)));
-        }
-
-        // Handle system operations
-        for chmod_pair in self.chmod {
-            ops.push(MountCommand::System(SystemOp::Chmod {
-                path: chmod_pair.path,
-                mode: chmod_pair.permissions,
-            }));
-        }
-
-        ops
     }
 }
 

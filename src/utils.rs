@@ -5,12 +5,13 @@ use nix::{
     fcntl::{FcntlArg, OFlag, fcntl, openat},
     libc::{PR_SET_NO_NEW_PRIVS, PROT_NONE, mprotect, prctl},
     sched::CloneFlags,
-    sys::{stat::Mode, utsname::uname},
+    sys::stat::Mode,
+    sys::utsname::uname,
     unistd::{Gid, Pid, SysconfVar, Uid, setfsuid, sysconf},
 };
 use std::{
     fs::{DirBuilder, File, Permissions, create_dir_all},
-    io::Write,
+    io::{ErrorKind, Write},
     os::{
         fd::{AsFd, AsRawFd, BorrowedFd},
         unix::fs::{DirBuilderExt, PermissionsExt},
@@ -154,25 +155,27 @@ pub fn ensure_file<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
 
 pub fn create_directory<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
     let path = path.as_ref();
-
     DirBuilder::new().mode(mode).recursive(true).create(path)?;
-
     Ok(())
 }
 
-pub fn ensure_directory<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
+pub fn ensure_dir_with_mode<P: AsRef<Path>>(path: P, mode: u32) -> Result<()> {
     let path = path.as_ref();
 
-    if path.exists() {
-        if !path.is_dir() {
-            bail!("Path \"{}\" is not a directory", path.to_string_lossy());
+    match DirBuilder::new().mode(mode).recursive(true).create(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            if !path.is_dir() {
+                bail!("Path \"{}\" is not a directory", path.display());
+            }
+            Ok(())
         }
-        return Ok(());
+        Err(e) => Err(e.into()),
     }
+}
 
-    DirBuilder::new().mode(mode).recursive(true).create(path)?;
-
-    Ok(())
+pub fn ensure_dir<P: AsRef<Path>>(path: P) -> Result<()> {
+    ensure_dir_with_mode(path, 0o755)
 }
 
 pub fn is_namespace_supported(flag: CloneFlags) -> bool {

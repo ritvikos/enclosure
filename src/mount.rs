@@ -1,179 +1,135 @@
+pub mod bind;
+pub mod pivot;
+
 use crate::{
-    config::{FileOp, MountCommand, MountCommands, MountOp, SpecialMount, SystemOp},
-    jail::Jail,
-    privsep::{Supervisor, Worker, privsep},
+    config::{MountEntry, NamespaceOptions},
     utils,
 };
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
+use nix::mount::{MsFlags, mount};
+use std::{
+    io,
+    os::unix::fs::symlink,
+    path::{Path, PathBuf},
+};
 
-impl Jail<'_> {
-    pub fn handle_mounts(&self, setuid: bool) -> Result<()> {
-        if setuid {
-            privsep::<MountCommand, _, _>(
-                |worker| self.mount_worker(worker),
-                |supervisor| self.mount_supervisor(supervisor),
-            )?;
+#[derive(Debug)]
+pub struct MountContext<'ctx> {
+    mount: &'ctx [MountEntry],
+    namespace: &'ctx NamespaceOptions,
+    oldroot: &'ctx Path,
+    newroot: &'ctx Path,
+}
+
+impl<'ctx> MountContext<'ctx> {
+    pub fn new<P1, P2>(
+        mount: &'ctx [MountEntry],
+        namespace: &'ctx NamespaceOptions,
+        oldroot: &'ctx P1,
+        newroot: &'ctx P2,
+    ) -> Self
+    where
+        P1: AsRef<Path> + ?Sized,
+        P2: AsRef<Path> + ?Sized,
+    {
+        MountContext {
+            mount,
+            namespace,
+            oldroot: oldroot.as_ref(),
+            newroot: newroot.as_ref(),
         }
+    }
+}
 
+impl<'ctx> MountContext<'ctx> {
+    pub fn apply(&self) -> Result<()> {
+        for mnt in self.mount {
+            self.apply_one(mnt)
+                .with_context(|| format!("Failed to apply mount entry: {mnt:?}"))?;
+        }
         Ok(())
     }
 
-    fn mount_supervisor(&self, supervisor: Supervisor<MountCommand>) -> Result<()> {
-        println!("[PARENT SUPERVISOR]: Waiting for Commands");
-
-        supervisor.listen(self.config, |_, cmd| match cmd {
-            MountCommand::Mount(op) => match op {
-                MountOp::Bind {
-                    source,
-                    target,
-                    options,
-                } => {
-                    todo!()
-                }
-
-                MountOp::Overlay {
-                    lowerdir,
-                    upperdir,
-                    workdir,
-                    target,
-                    mode,
-                } => {
-                    todo!()
-                }
-
-                MountOp::Special(special_mount) => match special_mount {
-                    SpecialMount::Proc(path_buf) => {
-                        todo!()
-                    }
-                    SpecialMount::Dev(path_buf) => {
-                        todo!()
-                    }
-                    SpecialMount::Tmpfs {
-                        target,
-                        size_kb,
-                        mode,
-                    } => {
-                        todo!()
-                    }
-                    SpecialMount::Mqueue(path_buf) => {
-                        todo!()
-                    }
-                    SpecialMount::OverlaySource {
-                        lowerdir,
-                        upperdir,
-                        workdir,
-                    } => {
-                        todo!()
-                    }
-                },
+    fn apply_one(&self, mnt: &MountEntry) -> Result<()> {
+        match mnt {
+            MountEntry::Dir { path, mode } => match mode {
+                Some(mode) => utils::ensure_dir_with_mode(path, **mode),
+                None => utils::ensure_dir(path),
             },
-
-            MountCommand::File(op) => match op {
-                FileOp::CreateDir(path_buf) => {
-                    todo!()
-                }
-                FileOp::CreateFile { fd, dest } => {
-                    todo!()
-                }
-                FileOp::CreateBindFile {
-                    source,
-                    dest,
-                    readonly,
-                } => {
-                    todo!()
-                }
-                FileOp::CreateSymlink { link_path, target } => {
-                    todo!()
-                }
-                FileOp::RemountReadOnly(path_buf) => {
-                    todo!()
-                }
-            },
-
-            MountCommand::System(op) => match op {
-                SystemOp::SetHostname(name) => {
-                    todo!()
-                }
-                SystemOp::Chmod { path, mode } => {
-                    todo!()
-                }
-            },
-        })?;
-
-        Ok(())
-    }
-
-    fn mount_worker(&self, worker: Worker<MountCommand>) -> Result<()> {
-        println!("[CHILD WORKER]: Sending Commands");
-
-        // TODO: drop privileges
-
-        let mount_config = self.config.mount.clone();
-        let commands = MountCommands::from(mount_config);
-
-        for command in commands.iter() {
-            match command {
-                MountCommand::Mount(op) => match op {
-                    MountOp::Bind {
-                        source,
-                        target,
-                        options,
-                    } => {
-                        if target.is_dir() {
-                            utils::ensure_directory(target, 0755)?;
-                        } else if target.is_file() {
-                            utils::ensure_file(target, 0444)?;
-                        }
-                    }
-
-                    MountOp::Overlay {
-                        lowerdir,
-                        upperdir,
-                        workdir,
-                        target,
-                        mode,
-                    } => {
-                        todo!()
-                    }
-
-                    MountOp::Special(mount) => match mount {
-                        SpecialMount::Proc(path_buf) => todo!(),
-                        SpecialMount::Dev(path_buf) => todo!(),
-                        SpecialMount::Tmpfs {
-                            target,
-                            size_kb,
-                            mode,
-                        } => todo!(),
-                        SpecialMount::Mqueue(path_buf) => todo!(),
-                        SpecialMount::OverlaySource {
-                            lowerdir,
-                            upperdir,
-                            workdir,
-                        } => todo!(),
-                    },
-                },
-
-                MountCommand::File(op) => match op {
-                    FileOp::CreateDir(path_buf) => todo!(),
-                    FileOp::CreateFile { fd, dest } => todo!(),
-                    FileOp::CreateBindFile {
-                        source,
-                        dest,
-                        readonly,
-                    } => todo!(),
-                    FileOp::CreateSymlink { link_path, target } => todo!(),
-                    FileOp::RemountReadOnly(path_buf) => todo!(),
-                },
-
-                MountCommand::System(op) => match op {
-                    SystemOp::SetHostname(name) => todo!(),
-                    SystemOp::Chmod { path, mode } => todo!(),
-                },
+            MountEntry::Mqueue { dest } => {
+                utils::ensure_dir(dest)?;
+                mount::<str, Path, str, str>(
+                    Some("mqueue"),
+                    &dest,
+                    Some("mqueue"),
+                    MsFlags::empty(),
+                    None,
+                )
+                .with_context(|| format!("Failed to mount mqueue at {}", dest.display()))?;
+                Ok(())
             }
+            MountEntry::Proc { dest } => self.apply_proc(dest),
+            MountEntry::Symlink { target, link } => self.apply_symlink(target, link),
+            _ => todo!("Mount entry type not implemented: {mnt:?}"),
+        }
+    }
 
-            worker.send(&command)?;
+    fn apply_proc(&self, dest: &Path) -> Result<()> {
+        // We've '/<new-root>/<dest>'
+        let target = self.rebase(dest);
+        utils::ensure_dir(&target)?;
+
+        match &self.namespace.unshare_pid {
+            true => {
+                mount::<str, std::path::Path, str, str>(
+                    Some("proc"),
+                    &target,
+                    Some("proc"),
+                    MsFlags::MS_NODEV | MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+                    None,
+                )
+                .with_context(|| format!("Failed to mount procfs at {}", target.display()))?;
+            }
+            false => {
+                todo!(
+                    "WIP: `BindMount` abstraction in mount/bind.rs to use system's proc-fs (w/ shared PID-NS)"
+                )
+            }
         }
 
+        // TODO: cleanup '/proc' special dirs that could be exploited: sys, sysrq, irq, bus
         Ok(())
+    }
+
+    // Too noisy, probably, it can be cleaned up later
+    fn apply_symlink(&self, target: &Path, link: &Path) -> Result<()> {
+        match symlink(target, link) {
+            Ok(()) => Ok(()),
+
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match link.read_link() {
+                Ok(existing) if existing == target => Ok(()),
+                Ok(existing) => Err(anyhow!(
+                    "can't make symlink at {}: existing destination is {}",
+                    link.display(),
+                    existing.display()
+                )),
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput => Err(anyhow!(
+                    "can't make symlink at {}: destination is not a symlink",
+                    link.display()
+                )),
+                Err(e) => Err(e).with_context(|| {
+                    format!(
+                        "can't make symlink at {}: can't read existing symlink target",
+                        link.display()
+                    )
+                }),
+            },
+
+            Err(e) => Err(e).with_context(|| format!("can't make symlink at {}", link.display())),
+        }
+    }
+
+    fn rebase(&self, dst: &Path) -> PathBuf {
+        self.newroot.join(dst.strip_prefix("/").unwrap_or(dst))
     }
 }
