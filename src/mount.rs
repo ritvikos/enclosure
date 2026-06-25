@@ -1,4 +1,5 @@
 pub mod bind;
+mod info;
 pub mod pivot;
 
 use crate::{
