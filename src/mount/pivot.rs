@@ -162,10 +162,20 @@ impl PivotContext<StagingMounted> {
                 source: e,
             })?;
 
+        // We're already in '/tmp'; no longer need <base-path>
+        let (old_root, new_root) = {
+            let strip_base = |path: &Path| -> Result<PathBuf, PivotError> {
+                path.strip_prefix(&self.base_path)
+                    .map_err(|_| PivotError::PathTraversal)
+                    .map(|p| p.to_path_buf())
+            };
+            (strip_base(&self.old_root)?, strip_base(&self.new_root)?)
+        };
+
         Ok(PivotContext {
             base_path: self.base_path,
-            old_root: self.old_root,
-            new_root: self.new_root,
+            old_root,
+            new_root,
             _state: PhantomData,
         })
     }
@@ -188,8 +198,8 @@ impl PivotContext<RootMounted> {
 
         Ok(PivotContext {
             base_path: PathBuf::from("/"),
-            old_root: PathBuf::from("/").join(&self.old_root),
-            new_root: PathBuf::from("/").join(&self.new_root),
+            old_root: self.old_root,
+            new_root: self.new_root,
             _state: PhantomData,
         })
     }
