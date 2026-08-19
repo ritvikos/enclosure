@@ -189,7 +189,6 @@ impl MountTree {
 
     pub(crate) fn flatten(&self) -> Result<Mounts<'_>, MountTreeError> {
         // TODO: init vec w/ capacity
-        // MAYBE: model as `MountTree<Parsed>` and `MountTree<Linked>`
         let mut mounts = Vec::new();
 
         // `self.ids_ordered` is guaranteed to have atleast the root mount-point.

@@ -6,6 +6,7 @@ use crate::{
     context::{Parent, PrivilegeLevel, ProcessContext, ROOTLESS_WITH_CAPABILITY_ERROR_MESSAGE},
     jail::Jail,
     jailer::{ExitHandler, HostResource, JailHandle, Jailer},
+    userns::{ExternalWriter, IdentityMap},
     utils,
 };
 use anyhow::{Result, bail};
@@ -127,7 +128,7 @@ impl Sandbox<Spawned> {
                 .map(Gid::from)
                 .unwrap_or_else(|| context.guid());
 
-            let map = utils::IdentityMap::new(
+            let map = IdentityMap::new(
                 namespace_uid,
                 namespace_gid,
                 context.ruid(),
@@ -135,7 +136,7 @@ impl Sandbox<Spawned> {
                 context.overflow_ids(),
             );
 
-            let writer = utils::ExternalWriter::new(child_pid, map);
+            let writer = ExternalWriter::new(child_pid, map);
 
             let proc_fd = nix::fcntl::open("/proc", OFlag::O_PATH, Mode::empty())?;
             writer.write(proc_fd.as_fd())?;

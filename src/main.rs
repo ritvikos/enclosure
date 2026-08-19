@@ -13,26 +13,28 @@ mod jail;
 mod jailer;
 mod mount;
 mod sandbox;
+mod stack;
+mod userns;
 mod utils;
 
+use crate::sandbox::Sandbox;
+use anyhow::Result;
 use clap::Parser;
 use config::Config;
 use context::{Parent, ProcessContext};
-use sandbox::Sandbox;
-use std::error::Error;
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<()> {
     ProcessContext::<Parent>::init()?;
 
     // SAFETY: parent context is initialized
-    // let context = unsafe { ProcessContext::<Parent>::get() };
+    let context = unsafe { ProcessContext::<Parent>::get() };
 
     let mut config = Config::parse();
-    config.prepare();
+    println!("Parsed config: {:#?}", config);
 
-    // if !context.setuid() && !context.real_root() && config.user.userns.is_none() {
-    //     config.namespace.unshare_user = true;
-    // }
+    if !context.setuid() && !context.real_root() && config.user.userns.is_none() {
+        config.namespace.unshare_user = true;
+    }
 
     let _ = Sandbox::new(config)?
         .spawn_jail()?

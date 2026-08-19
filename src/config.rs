@@ -1,8 +1,14 @@
-pub use crate::utils::{is_fd_valid, is_namespace_supported};
+pub use crate::{
+    mount::bind::AccessMode,
+    utils::{is_fd_valid, is_namespace_supported},
+};
 use anyhow::{Error, Result, anyhow};
 use clap::{ArgGroup, Args, Parser};
 use nix::sched::CloneFlags;
-use std::{path::PathBuf, str::FromStr};
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 // TODO: Following sections:
 // const HEADING_SECURITY: &str = "Security";
@@ -291,16 +297,38 @@ trait MountParser: Sized {
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum MountSource {
-    Path { target: PathBuf, mount_dev: bool },
-    Fd(i32),
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BindSourceKind {
+    Path { allow_missing: bool },
+    Fd { raw: i32 },
 }
 
 #[derive(Clone, Debug)]
-pub enum Mode {
-    ReadOnly,
-    ReadWrite,
+pub struct BindSource {
+    path: PathBuf,
+    kind: BindSourceKind,
+}
+
+impl BindSource {
+    #[inline]
+    fn new(path: PathBuf, kind: BindSourceKind) -> Self {
+        Self { path, kind }
+    }
+
+    #[inline]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[inline]
+    pub(crate) fn kind(&self) -> &BindSourceKind {
+        &self.kind
+    }
+
+    // #[inline]
+    // pub(crate) fn allow_missing(&self) -> bool {
+    //     self.allow_missing
+    // }
 }
 
 // CONSIDERATION: should we create data structure to parse src/dest/link/target?
@@ -309,9 +337,10 @@ pub enum Mode {
 pub enum MountEntry {
     // Bind mounts
     Bind {
-        src: MountSource,
+        src: BindSource,
         dest: PathBuf,
-        mode: Mode,
+        mode: AccessMode,
+        mount_dev: bool,
     },
 
     // File tree ops
@@ -382,8 +411,11 @@ impl FromStr for MountEntry {
 
 #[derive(Default)]
 struct BindOpts {
-    mode: Option<Mode>,
+    mode: Option<AccessMode>,
     mount_dev: bool,
+    // only use w/ path-source (ro/rw),
+    // unsupported w/ fd.
+    mount_try: bool,
 }
 struct BindMount;
 
@@ -399,15 +431,18 @@ impl BindOpts {
                         "duplicate 'mode' passed (either 'ro' or 'rw' is allowed)",
                     ));
                 }
-                "ro" => parsed.mode = Some(Mode::ReadOnly),
-                "rw" => parsed.mode = Some(Mode::ReadWrite),
-                "dev" if is_fd => {
-                    return Err(ParseMountError::option(
-                        BindMount::KIND,
-                        "'dev' cannot combine with {FD_PREFIX} sources",
-                    ));
-                }
+                "ro" => parsed.mode = Some(AccessMode::ReadOnly),
+                "rw" => parsed.mode = Some(AccessMode::ReadWrite),
                 "dev" => parsed.mount_dev = true,
+                "try" => {
+                    if is_fd {
+                        return Err(ParseMountError::option(
+                            BindMount::KIND,
+                            format!("'try' cannot be passed w/ 'fd' source"),
+                        ));
+                    }
+                    parsed.mount_try = true;
+                }
                 opt => {
                     return Err(ParseMountError::option(
                         BindMount::KIND,
@@ -423,7 +458,8 @@ impl BindOpts {
 
 impl MountParser for BindMount {
     const KIND: &'static str = "bind";
-    const SYNTAX: &'static str = "bind:<src>:<dest>[,ro|rw][,dev]  or  bind:fd=<N>:<dest>[,ro|rw]";
+    const SYNTAX: &'static str =
+        "bind:<src>:<dest>[,ro|rw][,dev,try]  or  bind:fd=<N>:<dest>[,ro|rw][,dev]";
 
     fn parse(rest: &str) -> Result<MountEntry, ParseMountError> {
         let (src, rest) = rest
@@ -443,29 +479,39 @@ impl MountParser for BindMount {
         };
 
         let is_fd = src.starts_with(FD_PREFIX);
-        let BindOpts { mode, mount_dev } = BindOpts::parse(opts, is_fd)?;
+        let BindOpts {
+            mode,
+            mount_dev,
+            mount_try,
+        } = BindOpts::parse(opts, is_fd)?;
 
-        let src = if let Some(fd) = src.strip_prefix(FD_PREFIX) {
-            MountSource::Fd(
-                fd.parse::<i32>()
-                    .map_err(|_| Self::err_syntax("invalid file descriptor"))?,
+        let (source_path, source_kind) = if let Some(fd) = src.strip_prefix(FD_PREFIX) {
+            let raw = fd
+                .parse::<i32>()
+                .map_err(|_| Self::err_syntax("invalid file descriptor"))?;
+            (
+                PathBuf::from(format!("/proc/self/fd/{raw}")),
+                BindSourceKind::Fd { raw },
             )
         } else {
-            MountSource::Path {
-                mount_dev,
-                target: (!src.is_empty())
+            (
+                (!src.is_empty())
                     .then(|| PathBuf::from(src))
                     .ok_or_else(|| Self::err_syntax("source path cannot be empty"))?,
-            }
+                BindSourceKind::Path {
+                    allow_missing: mount_try,
+                },
+            )
         };
 
         Ok(MountEntry::Bind {
-            src,
+            src: BindSource::new(source_path, source_kind),
             dest: PathBuf::from(dest),
             mode: mode.unwrap_or_else(|| {
                 println!("no mode specified for bind-mount, defaulting to 'rw'");
-                Mode::ReadWrite
+                AccessMode::ReadWrite
             }),
+            mount_dev,
         })
     }
 }
@@ -756,21 +802,36 @@ impl std::str::FromStr for ChmodPair {
     }
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum OctalPermissionsError {
+    #[error("octal-permissions out-of-range (0-0777): '{0:o}'")]
+    OutOfRange(u32),
+
+    #[error("invalid octal-permissions: '{0}'")]
+    Parse(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct OctalPermissions(u32);
+pub(crate) struct OctalPermissions(u32);
+
+impl TryFrom<u32> for OctalPermissions {
+    type Error = OctalPermissionsError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if value > 0o777 {
+            return Err(OctalPermissionsError::OutOfRange(value));
+        }
+        Ok(Self(value))
+    }
+}
 
 impl std::str::FromStr for OctalPermissions {
-    type Err = String;
+    type Err = OctalPermissionsError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let value =
-            u32::from_str_radix(s, 8).map_err(|_| format!("invalid octal permissions: '{}'", s))?;
-
-        if value < 0 || value > 0o7777 {
-            return Err(format!("octal permissions out-of-range (0-0777): '{}'", s));
-        }
-
-        Ok(OctalPermissions(value))
+        Self::try_from(
+            u32::from_str_radix(s, 8).map_err(|_| OctalPermissionsError::Parse(s.to_string()))?,
+        )
     }
 }
 
@@ -780,6 +841,10 @@ impl std::ops::Deref for OctalPermissions {
     fn deref(&self) -> &Self::Target {
         &self.0
     }
+}
+
+impl OctalPermissions {
+    pub(crate) const OWNER_RWX_GROUP_RX_OTHER_RX: Self = Self(0o755);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

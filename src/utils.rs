@@ -1,19 +1,17 @@
-use crate::{Parent, ProcessContext, context::OverFlowIds};
+use crate::{Parent, ProcessContext, config::OctalPermissions};
 use anyhow::{Context, Result, anyhow, bail};
-use memmap2::{MmapMut, MmapOptions};
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl, openat},
-    libc::{PR_SET_NO_NEW_PRIVS, PROT_NONE, mprotect, prctl},
+    libc::{PR_SET_NO_NEW_PRIVS, prctl},
     sched::CloneFlags,
-    sys::stat::Mode,
-    sys::utsname::uname,
-    unistd::{Gid, Pid, SysconfVar, Uid, setfsuid, sysconf},
+    sys::{stat::Mode, utsname::uname},
+    unistd::{Uid, setfsuid},
 };
 use std::{
     fs::{DirBuilder, File, Permissions, create_dir_all},
-    io::{ErrorKind, Write},
+    io::{self, ErrorKind},
     os::{
-        fd::{AsFd, AsRawFd, BorrowedFd},
+        fd::{AsRawFd, BorrowedFd},
         unix::fs::{DirBuilderExt, PermissionsExt},
     },
     path::{Path, PathBuf},
@@ -89,15 +87,6 @@ pub fn is_fd_valid(raw_fd: i32) -> Result<i32> {
     fcntl(fd, FcntlArg::F_GETFD)
         .map_err(|error| anyhow!(format!("\nInvalid file descriptor \n{error} ({raw_fd})")))?;
     Ok(raw_fd)
-}
-
-/// Returns the system page size.
-pub fn page_size() -> Result<usize> {
-    match sysconf(SysconfVar::PAGE_SIZE)? {
-        Some(size) if size > 0 => Ok(size as usize),
-        Some(_) => Err(anyhow!("PAGE_SIZE returned non-positive value")),
-        None => Err(anyhow!("PAGE_SIZE is not defined on this system")),
-    }
 }
 
 pub fn retry_on_interrupt<T, F>(mut operation: F) -> Result<T, std::io::Error>
@@ -209,62 +198,6 @@ pub(crate) fn is_cgroups_supported() -> bool {
     Path::new("/proc/self/ns/cgroup").exists()
 }
 
-/// A (mmap'ed) stack allocation with a guard page.
-pub struct GuardedStack {
-    _mmap: MmapMut,
-    stack: *mut u8,
-    size: usize,
-}
-
-impl GuardedStack {
-    /// Create a new instance of `GuardedStack`
-    pub fn new(stack_size: usize) -> Result<Self> {
-        let page_size = page_size()?;
-
-        if stack_size == 0 || stack_size % page_size != 0 {
-            return Err(anyhow!(
-                "stack_size must be a non-zero multiple of the system page size ({} bytes)",
-                page_size
-            ));
-        }
-
-        let total_size = stack_size
-            .checked_add(page_size)
-            .ok_or_else(|| anyhow!("stack_size + guard page overflows usize"))?;
-
-        let mut mmap = MmapOptions::new().len(total_size).map_anon()?;
-        let base_ptr = mmap.as_mut_ptr();
-
-        let guard_addr = unsafe { base_ptr.add(stack_size) };
-
-        // SAFETY:
-        // - guard_addr is page-aligned and within bounds.
-        // - `page_size` is guaranteed to be a page multiple.
-        // - `mmap` owns the memory.
-        let ret = unsafe { mprotect(guard_addr.cast(), page_size, PROT_NONE) };
-        if ret != 0 {
-            return Err(anyhow!(
-                "Failed to set guard page protection: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        Ok(Self {
-            _mmap: mmap,
-            stack: base_ptr,
-            size: stack_size,
-        })
-    }
-
-    /// Returns a mutable slice to the stack memory.
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY:
-        // - `stack` is offset beyond the guard page and points to `size` valid bytes.
-        // - A single mutable reference is created, single-threaded runtime.
-        unsafe { std::slice::from_raw_parts_mut(self.stack, self.size) }
-    }
-}
-
 pub struct Dir<'a> {
     fd: BorrowedFd<'a>,
 }
@@ -290,92 +223,64 @@ impl<'a> From<BorrowedFd<'a>> for Dir<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct IdentityMap {
-    sandbox_uid: Uid,
-    sandbox_gid: Gid,
-    host_uid: Uid,
-    host_gid: Gid,
-    overflow: OverFlowIds,
+pub(crate) fn ls(path: &str) {
+    println!("{path}:");
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let meta = entry.metadata().ok();
+                println!(
+                    "{:>10}  {}",
+                    meta.map(|m| m.len()).unwrap_or(0),
+                    entry.file_name().to_string_lossy()
+                );
+            }
+        }
+        Err(e) => eprintln!("failed to read {}: {}", path, e),
+    }
 }
 
-impl IdentityMap {
-    pub fn new(
-        sandbox_uid: Uid,
-        sandbox_gid: Gid,
-        host_uid: Uid,
-        host_gid: Gid,
-        overflow: OverFlowIds,
-    ) -> Self {
-        Self {
-            sandbox_uid,
-            sandbox_gid,
-            host_uid,
-            host_gid,
-            overflow,
+pub(crate) fn cat(path: &str) {
+    println!("{path}:");
+    match std::fs::read_to_string(path) {
+        Ok(contents) => println!("{}", contents),
+        Err(e) => eprintln!("failed to read {}: {}", path, e),
+    }
+}
+
+// basically; `mkdir -p` w/ permissions w/o returning error if directory already exists
+pub(crate) fn create_dir_recursive(path: &Path, mode: OctalPermissions) -> io::Result<()> {
+    let mut to_create = vec![];
+    let mut current = path;
+
+    loop {
+        match std::fs::metadata(current) {
+            Ok(meta) if meta.is_dir() => break,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} exists and is not a directory", current.display()),
+                ));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                to_create.push(current);
+                match current.parent() {
+                    Some(parent) => current = parent,
+                    None => break,
+                }
+            }
+            Err(e) => return Err(e),
         }
     }
 
-    pub fn uid_map(&self) -> String {
-        format!("{} {} 1\n", self.sandbox_uid, self.host_uid)
+    for dir in to_create.into_iter().rev() {
+        match DirBuilder::new().mode(*mode).create(dir) {
+            Ok(()) => {}
+            Err(_) if dir.is_dir() => {}
+            Err(e) => return Err(e),
+        }
     }
-
-    pub fn gid_map(&self) -> String {
-        format!("{} {} 1\n", self.sandbox_gid, self.host_gid)
-    }
-}
-
-fn write_proc_map_file(parent: &File, name: &str, content: &str) -> Result<()> {
-    let dir = Dir::from(parent.as_fd());
-    let mut file = dir.open_with(name, OFlag::O_WRONLY | OFlag::O_CLOEXEC)?;
-
-    retry_on_interrupt(|| file.write_all(content.as_bytes()))?;
-
     Ok(())
-}
-
-pub struct ExternalWriter {
-    pid: Pid,
-    map: IdentityMap,
-}
-
-impl ExternalWriter {
-    pub fn new(pid: Pid, map: IdentityMap) -> Self {
-        Self { pid, map }
-    }
-
-    pub fn write(&self, proc_fd: BorrowedFd<'_>) -> Result<()> {
-        let dir = Dir::from(proc_fd);
-        let pid_str = i32::from(self.pid).to_string();
-        let parent = dir.open_with(&pid_str, OFlag::O_PATH)?;
-
-        write_proc_map_file(&parent, "setgroups", "deny\n")?;
-        write_proc_map_file(&parent, "uid_map", &self.map.uid_map())?;
-        write_proc_map_file(&parent, "gid_map", &self.map.gid_map())?;
-
-        Ok(())
-    }
-}
-
-pub struct SelfWriter {
-    map: IdentityMap,
-}
-
-impl SelfWriter {
-    pub fn new(map: IdentityMap) -> Self {
-        Self { map }
-    }
-
-    pub fn write(&self, proc_fd: BorrowedFd<'_>) -> Result<()> {
-        let dir = Dir::from(proc_fd);
-        let parent = dir.open_with("self", OFlag::O_PATH)?;
-
-        write_proc_map_file(&parent, "setgroups", "deny\n")?;
-        write_proc_map_file(&parent, "uid_map", &self.map.uid_map())?;
-        write_proc_map_file(&parent, "gid_map", &self.map.gid_map())?;
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]

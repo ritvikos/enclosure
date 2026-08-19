@@ -7,7 +7,7 @@ use crate::{
         MountContext,
         pivot::{PivotContext, Uninitialized},
     },
-    utils::{IdentityMap, SelfWriter},
+    userns::{IdentityMap, SelfWriter},
 };
 use anyhow::Result;
 use nix::unistd::{Gid, Uid, execvp};
@@ -92,6 +92,8 @@ impl<'resource> Jail<'resource, AwaitingPrivileges> {
 }
 
 impl<'resource> Jail<'resource, Privileged> {
+    // TODO: use `OPEN_TREE_NAMESPACES` w/ `open_tree()` primarily,
+    //       fallback to `pivot_root()`, if unsupported.
     pub fn isolate(self) -> Result<Jail<'resource, Isolated>> {
         PivotContext::<Uninitialized>::new(BASE_PATH, NEW_ROOT, OLD_ROOT)?
             .enslave_and_mount()?
@@ -99,13 +101,18 @@ impl<'resource> Jail<'resource, Privileged> {
             .first_pivot()?
             .stage(
                 |oldroot_abs /* '/oldroot' */, newroot_abs /* '/newroot' */| {
-                    MountContext::new(
-                        &self.config.mount,
-                        &self.config.namespace,
+                    let ctx = MountContext::new(
                         oldroot_abs,
                         newroot_abs,
-                    )
-                    .apply()
+                        &self.resource,
+                        &self.config.namespace,
+                    );
+
+                    for mnt in &self.config.mount {
+                        mnt.apply(&ctx)?
+                    }
+
+                    Ok(())
                 },
             )?
             .detach_old_root()?

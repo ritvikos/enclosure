@@ -5,7 +5,7 @@ use crate::{
         reporter::ErrorReporter,
     },
     jail::{self, Jail},
-    utils::GuardedStack,
+    stack::GuardedStack,
 };
 use anyhow::{Context, Result, anyhow};
 use nix::{
@@ -19,7 +19,7 @@ use nix::{
     },
     unistd::Pid,
 };
-use std::os::fd::BorrowedFd;
+use std::{fmt::Debug, os::fd::BorrowedFd};
 
 mod sealed {
     pub trait Sealed {}
@@ -254,5 +254,13 @@ impl<'resource> HostResource<'resource> {
 impl Clone for HostResource<'_> {
     fn clone(&self) -> Self {
         Self::new(self.proc_fd)
+    }
+}
+
+impl Debug for HostResource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostResource")
+            .field("proc_fd", &self.proc_fd)
+            .finish()
     }
 }
