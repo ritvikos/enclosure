@@ -8,6 +8,7 @@ use nix::{
     sys::stat::Mode,
 };
 use std::{
+    borrow::Cow,
     io::Error as IoError,
     marker::PhantomData,
     os::fd::{AsFd, AsRawFd, BorrowedFd},
@@ -18,7 +19,7 @@ use std::{
 pub enum BindError {
     #[error("bind-mount failed: {stage}")]
     Mount {
-        stage: &'static str,
+        stage: Cow<'static, str>,
         #[source]
         source: IoError,
     },
@@ -58,7 +59,7 @@ pub enum AccessMode {
     ReadWrite,
 }
 
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum RemountPolicy {
     // Sub-mount re-mount failures are fatal.
     #[default]
@@ -68,7 +69,7 @@ pub enum RemountPolicy {
     Permissive,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct RemountOptions {
     access: AccessMode,
     recursive: bool,
@@ -165,6 +166,8 @@ impl<'a> BindMount<'a, Bound> {
         recursive: bool,
     ) -> Result<Self, BindError> {
         let destination = destination.as_ref().to_owned();
+        let src = src.as_ref();
+
         let flags = MsFlags::MS_SILENT
             | MsFlags::MS_BIND
             | match recursive {
@@ -172,11 +175,16 @@ impl<'a> BindMount<'a, Bound> {
                 false => MsFlags::empty(),
             };
 
-        mount::<Path, Path, str, str>(Some(src.as_ref()), &destination, None, flags, None)
-            .map_err(|e| BindError::Mount {
-                stage: "initial bind-mount",
+        mount::<Path, Path, str, str>(Some(src), &destination, None, flags, None).map_err(|e| {
+            BindError::Mount {
+                stage: Cow::Owned(format!(
+                    "initial bind-mount: src='{}',dst='{}'",
+                    src.display(),
+                    destination.display()
+                )),
                 source: IoError::from(e),
-            })?;
+            }
+        })?;
 
         Ok(Self {
             destination,
@@ -200,7 +208,10 @@ impl<'a> BindMount<'a, Bound> {
     }
 
     pub fn resolve_tree(self, oldroot: &Path) -> Result<BindMount<'a, TreeResolved>, BindError> {
-        println!("destination: {}", self.destination.display());
+        println!(
+            "[resolve_tree]: destination: {}",
+            self.destination.display()
+        );
 
         let kernel_resolved_dest = {
             let resolved_destination =
@@ -210,7 +221,11 @@ impl<'a> BindMount<'a, Bound> {
                         source,
                         stage: "canonicalizing <destination> path",
                     })?;
-            println!("resolved_destination: {}", resolved_destination.display());
+
+            println!(
+                "[resolve_tree]: resolved_destination: {}",
+                resolved_destination.display()
+            );
 
             let resolved_destination_fd = {
                 nix::fcntl::open(
@@ -244,11 +259,6 @@ impl<'a> BindMount<'a, Bound> {
                     stage: "canonicalizing <old-root> destination proc path",
                 })?
         };
-
-        println!(
-            "<old-root> proc path (kernel_resolved_dest): {}",
-            kernel_resolved_dest.display()
-        );
 
         Ok(BindMount {
             destination: self.destination,

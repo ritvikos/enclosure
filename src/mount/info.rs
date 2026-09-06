@@ -11,6 +11,7 @@ use nix::{
     },
 };
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fs::File,
     io::{BufRead, BufReader, Error as IoError, Lines},
@@ -179,6 +180,12 @@ impl MountTree {
             }
         }
 
+        println!("parsed mountpoints");
+        for node_id in ids_ordered.iter() {
+            let mntline = arena[*node_id].get();
+            println!("\t{}", mntline.mountpoint.display(),);
+        }
+
         MountTree {
             arena,
             id_lookup,
@@ -192,12 +199,22 @@ impl MountTree {
         let mut mounts = Vec::new();
 
         // `self.ids_ordered` is guaranteed to have atleast the root mount-point.
-        // MAYBE: expose abstraction?
-        let root_id = self.ids_ordered[0];
+        let root_id = self
+            .ids_ordered
+            .iter()
+            .find(|id| self.arena[**id].get().mountpoint == self.root_mnt)
+            .copied()
+            .ok_or(MountTreeError::MissingRoot)?;
 
         self.flatten_inner(root_id, &mut mounts);
         if mounts.is_empty() {
             return Err(MountTreeError::MissingRoot);
+        }
+
+        println!("flattened mountpoints");
+        for mount in mounts.iter() {
+            let mntline = self.arena[*mount].get();
+            println!("\t{}", mntline.mountpoint.display(),);
         }
 
         return Ok(Mounts {
@@ -237,11 +254,13 @@ impl<'a> Mounts<'a> {
         // `self.mounts` is guaranteed to have atleast the root mount-point.
         let current_flags = self.arena[self.mounts[0]].get().options();
         let restricted_flags = self.restrict_flags(current_flags, options);
+        println!("current_flags: {:?}", current_flags);
+        println!("restricted_flags: {:?}", restricted_flags);
         if current_flags == restricted_flags {
             return Ok(());
         }
         Self::_remount(target, restricted_flags).map_err(|e| BindError::Mount {
-            stage: "re-mounting root-mount-point w/ restricted-flags",
+            stage: Cow::Borrowed("re-mounting root-mount-point w/ restricted-flags"),
             source: IoError::from(e),
         })
     }
@@ -261,7 +280,9 @@ impl<'a> Mounts<'a> {
                     match options.remount_policy() {
                         RemountPolicy::Restrictive => {
                             return Err(BindError::Mount {
-                                stage: "re-mounting sub-mount-point w/ restricted-flags",
+                                stage: Cow::Borrowed(
+                                    "re-mounting sub-mount-point w/ restricted-flags",
+                                ),
                                 source: IoError::from(errno),
                             });
                         }
@@ -280,6 +301,7 @@ impl<'a> Mounts<'a> {
     }
 
     fn restrict_flags(&self, current_flags: MountFlags, options: &RemountOptions) -> MountFlags {
+        println!("options: {:?}", options);
         let mut restricted = current_flags;
         if !options.devices() {
             restricted.insert(MountFlags::NODEV);
@@ -287,6 +309,7 @@ impl<'a> Mounts<'a> {
         if options.access() == AccessMode::ReadOnly {
             restricted.insert(MountFlags::RDONLY);
         }
+        restricted.insert(MountFlags::NOSUID);
         restricted
     }
 
